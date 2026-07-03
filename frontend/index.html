@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GeoMultiAgent · Análisis de Observación de la Tierra</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg:       #0a0e1a;
+      --surface:  #111827;
+      --border:   #1e2d45;
+      --accent:   #00d4ff;
+      --accent2:  #00ff9d;
+      --warn:     #ff6b35;
+      --text:     #e2e8f0;
+      --muted:    #64748b;
+      --font:     'Space Grotesk', sans-serif;
+      --mono:     'JetBrains Mono', monospace;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ───────────────────────────────────────────────── */
+    header {
+      padding: 1.25rem 2rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      background: rgba(10,14,26,.95);
+      backdrop-filter: blur(12px);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .logo { display: flex; align-items: center; gap: .6rem; }
+    .logo svg { width: 32px; height: 32px; }
+    .logo-text { font-size: 1.1rem; font-weight: 700; letter-spacing: -.01em; }
+    .logo-text span { color: var(--accent); }
+    .badge {
+      margin-left: auto;
+      font-size: .7rem;
+      font-family: var(--mono);
+      color: var(--accent2);
+      border: 1px solid var(--accent2);
+      padding: .2rem .5rem;
+      border-radius: 4px;
+      opacity: .8;
+    }
+
+    /* ── Main layout ──────────────────────────────────────────── */
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 420px 1fr;
+      grid-template-rows: 1fr;
+      gap: 0;
+      height: calc(100vh - 65px);
+      overflow: hidden;
+    }
+
+    /* ── Left panel ───────────────────────────────────────────── */
+    .left-panel {
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .query-section {
+      padding: 1.5rem;
+      border-bottom: 1px solid var(--border);
+    }
+    .query-section h2 {
+      font-size: .7rem;
+      font-weight: 600;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 1rem;
+    }
+
+    .examples {
+      display: flex;
+      flex-wrap: wrap;
+      gap: .4rem;
+      margin-bottom: 1rem;
+    }
+    .example-chip {
+      font-size: .72rem;
+      padding: .3rem .65rem;
+      border-radius: 20px;
+      border: 1px solid var(--border);
+      cursor: pointer;
+      color: var(--muted);
+      transition: all .2s;
+      font-family: var(--font);
+      background: transparent;
+    }
+    .example-chip:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: rgba(0,212,255,.06);
+    }
+
+    textarea {
+      width: 100%;
+      background: rgba(255,255,255,.03);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: .9rem;
+      line-height: 1.5;
+      padding: .85rem 1rem;
+      resize: vertical;
+      min-height: 110px;
+      outline: none;
+      transition: border-color .2s;
+    }
+    textarea:focus { border-color: var(--accent); }
+    textarea::placeholder { color: var(--muted); }
+
+    .btn-run {
+      margin-top: .75rem;
+      width: 100%;
+      padding: .8rem;
+      background: linear-gradient(135deg, var(--accent), #0096cc);
+      border: none;
+      border-radius: 8px;
+      color: #000;
+      font-family: var(--font);
+      font-size: .9rem;
+      font-weight: 700;
+      cursor: pointer;
+      letter-spacing: .03em;
+      transition: opacity .2s, transform .1s;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: .5rem;
+    }
+    .btn-run:hover { opacity: .9; }
+    .btn-run:active { transform: scale(.99); }
+    .btn-run:disabled { opacity: .4; cursor: not-allowed; }
+
+    /* ── Agent timeline ───────────────────────────────────────── */
+    .timeline-section {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1.25rem;
+    }
+    .timeline-section h2 {
+      font-size: .7rem;
+      font-weight: 600;
+      letter-spacing: .1em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 1rem;
+    }
+
+    .timeline { display: flex; flex-direction: column; gap: .5rem; }
+
+    .tl-item {
+      display: flex;
+      gap: .75rem;
+      align-items: flex-start;
+    }
+    .tl-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--border);
+      margin-top: .35rem;
+      flex-shrink: 0;
+      transition: background .3s;
+      position: relative;
+    }
+    .tl-dot.active { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+    .tl-dot.done   { background: var(--accent2); }
+    .tl-dot.error  { background: var(--warn); }
+
+    .tl-body { flex: 1; min-width: 0; }
+    .tl-agent {
+      font-size: .75rem;
+      font-weight: 600;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+    .tl-text {
+      font-size: .8rem;
+      color: var(--muted);
+      margin-top: .1rem;
+      word-break: break-word;
+    }
+
+    /* Spinner */
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner {
+      width: 14px; height: 14px;
+      border: 2px solid rgba(0,212,255,.3);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin .7s linear infinite;
+      display: none;
+    }
+    .spinner.active { display: inline-block; }
+
+    /* ── Right panel ──────────────────────────────────────────── */
+    .right-panel {
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .tabs {
+      display: flex;
+      gap: 0;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+    }
+    .tab {
+      padding: .85rem 1.4rem;
+      font-size: .82rem;
+      font-weight: 500;
+      cursor: pointer;
+      border-bottom: 2px solid transparent;
+      transition: color .2s, border-color .2s;
+      color: var(--muted);
+      background: transparent;
+      border-top: none;
+      border-left: none;
+      border-right: none;
+      font-family: var(--font);
+    }
+    .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab:hover { color: var(--text); }
+
+    .tab-content { flex: 1; overflow: hidden; display: none; }
+    .tab-content.active { display: flex; flex-direction: column; overflow: hidden; }
+
+    /* Report tab */
+    #tab-report {
+      padding: 2rem;
+      overflow-y: auto;
+    }
+    .report-placeholder {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      gap: 1rem;
+    }
+    .report-placeholder svg { opacity: .3; }
+    .report-placeholder p { font-size: .9rem; }
+
+    /* Markdown styles */
+    .markdown h1,h2,h3 { margin: 1.2rem 0 .5rem; color: var(--text); }
+    .markdown h1 { font-size: 1.4rem; }
+    .markdown h2 { font-size: 1.1rem; color: var(--accent); }
+    .markdown h3 { font-size: .95rem; color: var(--accent2); }
+    .markdown p  { line-height: 1.7; color: #cbd5e1; margin-bottom: .8rem; font-size: .9rem; }
+    .markdown ul,ol { padding-left: 1.4rem; margin-bottom: .8rem; }
+    .markdown li { line-height: 1.6; color: #94a3b8; font-size: .88rem; }
+    .markdown strong { color: var(--text); }
+    .markdown code { font-family: var(--mono); font-size: .8rem; background: rgba(255,255,255,.07); padding: .1rem .3rem; border-radius: 3px; }
+    .markdown pre { background: rgba(0,0,0,.4); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; overflow-x: auto; margin-bottom: 1rem; }
+    .markdown pre code { background: none; padding: 0; font-size: .8rem; }
+
+    /* Map tab */
+    #tab-map { padding: 0; }
+    #map-frame { width: 100%; height: 100%; border: none; background: #0a0e1a; }
+    .map-placeholder {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      gap: 1rem;
+    }
+
+    /* Code tab */
+    #tab-code { overflow-y: auto; }
+    pre.code-block {
+      font-family: var(--mono);
+      font-size: .78rem;
+      line-height: 1.6;
+      padding: 1.5rem;
+      color: #a5f3fc;
+      background: transparent;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .code-placeholder {
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      font-size: .9rem;
+    }
+
+    /* Stats tab */
+    #tab-stats { padding: 1.5rem; overflow-y: auto; }
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+      gap: .75rem;
+      margin-bottom: 1.5rem;
+    }
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+    }
+    .stat-card .label { font-size: .7rem; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+    .stat-card .value { font-size: 1.4rem; font-weight: 700; margin-top: .2rem; color: var(--accent); font-variant-numeric: tabular-nums; }
+    .stat-card .index-name { font-size: .75rem; color: var(--accent2); margin-bottom: .4rem; font-weight: 600; }
+
+    /* Status bar */
+    .status-bar {
+      padding: .5rem 1.5rem;
+      border-top: 1px solid var(--border);
+      font-size: .72rem;
+      font-family: var(--mono);
+      color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: .75rem;
+    }
+    .status-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+    .status-dot.ok    { background: var(--accent2); box-shadow: 0 0 6px var(--accent2); }
+    .status-dot.busy  { background: var(--accent);  box-shadow: 0 0 6px var(--accent); animation: pulse 1s infinite; }
+    .status-dot.error { background: var(--warn); }
+    @keyframes pulse { 50% { opacity: .3; } }
+
+    /* scrollbar */
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <svg viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="20" cy="20" r="18" stroke="#00d4ff" stroke-width="1.5"/>
+      <ellipse cx="20" cy="20" rx="18" ry="7" stroke="#00d4ff" stroke-width="1" stroke-dasharray="3 2"/>
+      <circle cx="20" cy="20" r="5" fill="#00d4ff" opacity=".8"/>
+      <circle cx="32" cy="14" r="2.5" fill="#00ff9d"/>
+    </svg>
+    <div class="logo-text">Geo<span>MultiAgent</span></div>
+  </div>
+  <div class="badge">VIU - Universidad Internacional de Valencia </div>
+</header>
+
+<main>
+  <!-- ── Left panel ──────────────────────────────────────────────── -->
+  <div class="left-panel">
+    <div class="query-section">
+      <h2>Consulta en lenguaje natural</h2>
+      <div class="examples">
+        <button class="example-chip" onclick="setExample(this)">Vegetación Madrid</button>
+        <button class="example-chip" onclick="setExample(this)">Inundaciones Valencia</button>
+        <button class="example-chip" onclick="setExample(this)">Deforestación Amazonia</button>
+        <button class="example-chip" onclick="setExample(this)">Expansión urbana Barcelona</button>
+        <button class="example-chip" onclick="setExample(this)">Incendios Canarias</button>
+      </div>
+      <textarea id="query-input"
+        placeholder="Ej: Analiza el estado de la vegetación en la Comunidad de Madrid durante el verano de 2024"
+      ></textarea>
+      <button class="btn-run" id="btn-run" onclick="runQuery()">
+        <span id="btn-spinner" class="spinner"></span>
+        <span id="btn-text">▶ Ejecutar análisis</span>
+      </button>
+    </div>
+
+    <div class="timeline-section">
+      <h2>Pipeline de agentes</h2>
+      <div class="timeline" id="timeline">
+        <div class="tl-item" id="tl-planner">
+          <div class="tl-dot" id="dot-planner"></div>
+          <div class="tl-body">
+            <div class="tl-agent">🧠 Agente Planificador</div>
+            <div class="tl-text" id="txt-planner">En espera…</div>
+          </div>
+        </div>
+        <div class="tl-item" id="tl-data_acquisition">
+          <div class="tl-dot" id="dot-data_acquisition"></div>
+          <div class="tl-body">
+            <div class="tl-agent">🛰 Agente Adquisición</div>
+            <div class="tl-text" id="txt-data_acquisition">En espera…</div>
+          </div>
+        </div>
+        <div class="tl-item" id="tl-analyst">
+          <div class="tl-dot" id="dot-analyst"></div>
+          <div class="tl-body">
+            <div class="tl-agent">📊 Agente Analista</div>
+            <div class="tl-text" id="txt-analyst">En espera…</div>
+          </div>
+        </div>
+        <div class="tl-item" id="tl-reporter">
+          <div class="tl-dot" id="dot-reporter"></div>
+          <div class="tl-body">
+            <div class="tl-agent">📝 Agente Informe</div>
+            <div class="tl-text" id="txt-reporter">En espera…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Right panel ─────────────────────────────────────────────── -->
+  <div class="right-panel">
+    <div class="tabs">
+      <button class="tab active" onclick="showTab('report')">📄 Informe</button>
+      <button class="tab" onclick="showTab('map')">🗺 Mapa</button>
+      <button class="tab" onclick="showTab('stats')">📈 Índices</button>
+      <button class="tab" onclick="showTab('code')">⌨ Código</button>
+    </div>
+
+    <!-- Report -->
+    <div class="tab-content active" id="tab-report">
+      <div class="report-placeholder" id="report-placeholder">
+        <svg width="64" height="64" viewBox="0 0 64 64" fill="none">
+          <circle cx="32" cy="32" r="30" stroke="#1e2d45" stroke-width="2"/>
+          <path d="M20 24h24M20 32h16M20 40h20" stroke="#1e2d45" stroke-width="2" stroke-linecap="round"/>
+        </svg>
+        <p>Introduce una consulta y ejecuta el análisis</p>
+      </div>
+      <div class="markdown" id="report-content" style="display:none;padding:2rem;overflow-y:auto;flex:1;"></div>
+    </div>
+
+    <!-- Map -->
+    <div class="tab-content" id="tab-map">
+      <div class="map-placeholder" id="map-placeholder">
+        <svg width="64" height="64" viewBox="0 0 64 64" fill="none">
+          <rect x="8" y="16" width="48" height="36" rx="4" stroke="#1e2d45" stroke-width="2"/>
+          <circle cx="32" cy="34" r="8" stroke="#1e2d45" stroke-width="2"/>
+          <line x1="32" y1="16" x2="32" y2="50" stroke="#1e2d45" stroke-width="1" stroke-dasharray="3"/>
+        </svg>
+        <p>El mapa aparecerá aquí tras el análisis</p>
+      </div>
+      <iframe id="map-frame" style="display:none;" src="about:blank"></iframe>
+    </div>
+
+    <!-- Stats -->
+    <div class="tab-content" id="tab-stats">
+      <div class="map-placeholder" id="stats-placeholder">
+        <p style="font-size:.9rem">Las estadísticas de los índices aparecerán aquí</p>
+      </div>
+      <div id="stats-content" style="display:none;padding:1.5rem;overflow-y:auto;"></div>
+    </div>
+
+    <!-- Code -->
+    <div class="tab-content" id="tab-code">
+      <div class="code-placeholder" id="code-placeholder">El script Python generado aparecerá aquí</div>
+      <pre class="code-block" id="code-content" style="display:none;"></pre>
+    </div>
+  </div>
+</main>
+
+<div class="status-bar">
+  <div class="status-dot" id="status-dot"></div>
+  <span id="status-text">Listo</span>
+</div>
+
+<script>
+  const API_BASE = window.location.origin;
+  let ws = null;
+
+  const EXAMPLE_QUERIES = {
+    "Vegetación Madrid":        "Analiza el estado de la vegetación en la Comunidad de Madrid entre junio y agosto de 2024. Calcula el NDVI y el EVI usando imágenes Sentinel-2 con menos del 15% de nubosidad.",
+    "Inundaciones Valencia":    "Detecta la extensión de las inundaciones en la provincia de Valencia en noviembre de 2024. Usa el índice NDWI y MNDWI con imágenes Sentinel-2.",
+    "Deforestación Amazonia":   "Evalúa la deforestación en el estado de Pará, Brasil, comparando imágenes Landsat-8 del primer trimestre de 2023 y 2024. Calcula la pérdida de cobertura forestal.",
+    "Expansión urbana Barcelona":"Analiza la expansión urbana en el área metropolitana de Barcelona entre 2020 y 2024 usando el índice NDBI con imágenes Sentinel-2.",
+    "Incendios Canarias":       "Evalúa la superficie quemada en las Islas Canarias durante el verano de 2023. Usa el índice NBR para detectar las áreas afectadas por los incendios forestales.",
+  };
+
+  function setExample(btn) {
+    const q = EXAMPLE_QUERIES[btn.textContent];
+    if (q) document.getElementById('query-input').value = q;
+  }
+
+  function showTab(name) {
+    document.querySelectorAll('.tab').forEach((t,i)=>{
+      t.classList.toggle('active', ['report','map','stats','code'][i]===name);
+    });
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    document.getElementById('tab-'+name).classList.add('active');
+  }
+
+  function setStatus(state, text) {
+    const dot  = document.getElementById('status-dot');
+    const span = document.getElementById('status-text');
+    dot.className  = 'status-dot ' + state;
+    span.textContent = text;
+  }
+
+  function setAgentState(agent, state, text) {
+    const dot = document.getElementById('dot-' + agent);
+    const txt = document.getElementById('txt-' + agent);
+    if (!dot) return;
+    dot.className = 'tl-dot ' + state;
+    if (txt && text) txt.textContent = text;
+  }
+
+  function setBusy(busy) {
+    const btn     = document.getElementById('btn-run');
+    const spinner = document.getElementById('btn-spinner');
+    const btnTxt  = document.getElementById('btn-text');
+    btn.disabled         = busy;
+    spinner.classList.toggle('active', busy);
+    btnTxt.textContent   = busy ? 'Analizando…' : '▶ Ejecutar análisis';
+  }
+
+  function renderMarkdown(md) {
+    // Very lightweight markdown renderer (no external dep)
+    return md
+      .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+      .replace(/^## (.+)$/gm,  '<h2>$1</h2>')
+      .replace(/^# (.+)$/gm,   '<h1>$1</h1>')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*(.+?)\*/g,   '<em>$1</em>')
+      .replace(/`([^`]+)`/g,   '<code>$1</code>')
+      .replace(/^- (.+)$/gm,   '<li>$1</li>')
+      .replace(/((<li>.+<\/li>\n?)+)/g, '<ul>$1</ul>')
+      .replace(/\n\n/g, '</p><p>')
+      .replace(/^(.+)$/gm, (m) => m.startsWith('<') ? m : m)
+      .replace(/\n/g, '<br>');
+  }
+
+  function showReport(md) {
+    document.getElementById('report-placeholder').style.display = 'none';
+    const el = document.getElementById('report-content');
+    el.style.display = 'block';
+    el.innerHTML = '<div class="markdown">' + renderMarkdown(md) + '</div>';
+  }
+
+  function showMap(url) {
+    document.getElementById('map-placeholder').style.display = 'none';
+    const frame = document.getElementById('map-frame');
+    frame.style.display = 'none';
+
+    // Buscar imágenes de índices en outputs
+    const indices = ['ndvi', 'evi', 'ndwi', 'ndbi', 'nbr', 'ndsi'];
+    const container = document.getElementById('tab-map');
+
+    let html = `<div style="padding:1.5rem;overflow-y:auto;flex:1;">
+      <div style="font-size:.7rem;font-weight:600;letter-spacing:.1em;text-transform:uppercase;
+                  color:var(--muted);margin-bottom:1rem;">Visualización de índices</div>`;
+
+    indices.forEach(idx => {
+      html += `<div class="index-img-block" id="img-${idx}" style="display:none;margin-bottom:2rem;">
+        <div style="font-size:.85rem;font-weight:600;color:var(--accent2);margin-bottom:.5rem;">
+          ${idx.toUpperCase()}
+        </div>
+        <img src="/outputs/${idx}.png" style="width:100%;border-radius:8px;border:1px solid var(--border);"
+            onload="document.getElementById('img-${idx}').style.display='block'"
+            onerror="document.getElementById('img-${idx}').style.display='none'" />
+        <div style="display:flex;justify-content:space-between;margin-top:.4rem;font-size:.72rem;color:var(--muted);">
+          <span>🔴 Bajo / Sin vegetación</span>
+          <span>🟡 Moderado</span>
+          <span>🟢 Alto / Vegetación densa</span>
+        </div>
+      </div>`;
+    });
+
+    html += `<div id="img-summary" style="display:none;margin-bottom:2rem;">
+      <div style="font-size:.85rem;font-weight:600;color:var(--accent2);margin-bottom:.5rem;">
+        Resumen
+      </div>
+      <img src="/outputs/summary.png" style="width:100%;border-radius:8px;border:1px solid var(--border);"
+          onload="document.getElementById('img-summary').style.display='block'"
+          onerror="document.getElementById('img-summary').style.display='none'" />
+    </div></div>`;
+
+    container.innerHTML = html;
+  }
+
+  function showStats(indices) {
+    if (!indices || !Object.keys(indices).length) return;
+    document.getElementById('stats-placeholder').style.display = 'none';
+    const el = document.getElementById('stats-content');
+    el.style.display = 'block';
+    let html = '';
+
+    for (const [name, stats] of Object.entries(indices)) {
+      html += `<div style="margin-bottom:2rem;">
+        <div style="font-size:.8rem;font-weight:600;color:var(--accent2);text-transform:uppercase;
+                    letter-spacing:.08em;margin-bottom:.75rem;border-bottom:1px solid var(--border);
+                    padding-bottom:.4rem;">${name}</div>
+        <div class="stats-grid">`;
+
+      for (const [k, v] of Object.entries(stats)) {
+        if (typeof v === 'object' && v !== null) {
+          // Percentiles u objeto anidado → expandir
+          for (const [pk, pv] of Object.entries(v)) {
+            const fmt = typeof pv === 'number' ? pv.toFixed(4) : pv;
+            html += `<div class="stat-card">
+              <div class="label">${pk}</div>
+              <div class="value" style="font-size:1rem;">${fmt}</div>
+            </div>`;
+          }
+        } else {
+          const fmt = typeof v === 'number' ? v.toFixed(4) : v;
+          html += `<div class="stat-card">
+            <div class="label">${k}</div>
+            <div class="value">${fmt}</div>
+          </div>`;
+        }
+      }
+      html += `</div></div>`;
+    }
+    el.innerHTML = html;
+  }
+
+  function showCode(code) {
+    if (!code) return;
+    document.getElementById('code-placeholder').style.display = 'none';
+    const el = document.getElementById('code-content');
+    el.style.display = 'block';
+    el.textContent = code;
+  }
+
+  async function runQuery() {
+    const query = document.getElementById('query-input').value.trim();
+    if (!query) { alert('Por favor escribe una consulta.'); return; }
+
+    setBusy(true);
+    setStatus('busy', 'Conectando con el pipeline…');
+
+    // Reset timeline
+    ['planner','data_acquisition','analyst','reporter'].forEach(a => {
+      setAgentState(a, '', 'En espera…');
+    });
+
+    const sessionId = 'sess_' + Math.random().toString(36).slice(2,8);
+    const wsUrl = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/${sessionId}`;
+
+    ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      setStatus('busy', 'Conexión establecida');
+      ws.send(JSON.stringify({ query }));
+    };
+
+    ws.onmessage = (evt) => {
+      const msg = JSON.parse(evt.data);
+
+      if (msg.type === 'agent_start') {
+        setAgentState(msg.agent, 'active', 'Procesando…');
+        setStatus('busy', `Agente activo: ${msg.agent}`);
+      }
+      else if (msg.type === 'agent_log') {
+        setAgentState(msg.agent, 'active', msg.content);
+      }
+      else if (msg.type === 'completed') {
+        const data = msg.data || {};
+        ['planner','data_acquisition','analyst','reporter'].forEach(a =>
+          setAgentState(a, 'done', 'Completado ✓')
+        );
+        if (data.report)   showReport(data.report);
+        if (data.map_url)  showMap(data.map_url);
+        if (data.computed_indices) showStats(data.computed_indices);
+        if (data.generated_code)    showCode(data.generated_code);
+        setStatus('ok', 'Análisis completado');
+        setBusy(false);
+      }
+      else if (msg.type === 'error') {
+        setStatus('error', 'Error: ' + msg.content);
+        setAgentState(msg.agent || 'planner', 'error', msg.content);
+        showReport(`## ⚠ Error en el pipeline\n\n${msg.content}`);
+        setBusy(false);
+      }
+    };
+
+    ws.onerror = () => {
+      // Fallback to HTTP polling if WebSocket fails
+      setStatus('busy', 'WS no disponible, usando HTTP…');
+      ws = null;
+      runQueryHTTP(query, sessionId);
+    };
+
+    ws.onclose = () => {
+      if (document.getElementById('btn-run').disabled) {
+        setBusy(false);
+      }
+    };
+  }
+
+  async function runQueryHTTP(query, sessionId) {
+    // Simulate step-by-step progress with HTTP
+    const agents = ['planner','data_acquisition','analyst','reporter'];
+    const labels = ['Planificando análisis…','Buscando imágenes satelitales…','Ejecutando código geoespacial…','Generando informe…'];
+
+    for (let i = 0; i < agents.length; i++) {
+      setAgentState(agents[i], 'active', labels[i]);
+      setStatus('busy', labels[i]);
+      await new Promise(r => setTimeout(r, 400));
+    }
+
+    try {
+      const res = await fetch(`${API_BASE}/api/query`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query, session_id: sessionId }),
+      });
+      const data = await res.json();
+
+      agents.forEach(a => setAgentState(a, 'done', 'Completado ✓'));
+
+      if (data.report)   showReport(data.report);
+      if (data.map_url)  showMap(data.map_url);
+      if (data.computed_indices) showStats(data.computed_indices);
+      if (data.generated_code)    showCode(data.generated_code);
+
+      setStatus('ok', 'Análisis completado');
+    } catch (err) {
+      setStatus('error', err.message);
+      agents.forEach(a => setAgentState(a, 'error', ''));
+    } finally {
+      setBusy(false);
+    }
+  }
+</script>
+</body>
+</html>
