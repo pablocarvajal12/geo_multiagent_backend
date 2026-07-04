@@ -79,18 +79,10 @@ return a STRICT JSON execution plan — no extra text, only the JSON object.
 - Keep bbox TIGHT (≤ 0.5° × 0.5°) to target the specific flood zone, not a whole region.
 - General rule: for coastal flood queries, keep max_lon ≤ centroid_lon + 0.2°.
 
-## DANA Valencia October 2024 — hardcoded parameters
-- If the query mentions: DANA, Valencia floods, inundaciones Valencia, octubre 2024, L'Horta Sud, Paiporta, Catarroja, Alfafar, Massanassa, or similar:
-  - location.name: USE THE NAME THE USER SAID (e.g. "Valencia" if they said "Valencia") — do NOT replace it with "L'Horta Sud"
-  - bbox: [-0.55, 39.30, -0.25, 39.55]   ← targets the flood zone near Valencia
-  - date_range: 2024-10-30 to 2024-11-10  ← post-DANA window with clearing skies
-  - cloud_cover_max: 60
-  - required_indices: ["NDWI", "MNDWI", "AWEI"]
-  - analysis_type: "flood"
-
-## Date range rules for known events
-- If the query mentions the DANA Valencia 2024 or Valencia floods October 2024: use date_range 2024-10-30 to 2024-11-10.
-- For event-based flood queries, prefer the post-event window (event_date to event_date + 7 days) over the full month.
+## Event-based flood queries
+- If the query names a specific storm/flood event, use your own knowledge of that event's
+  real date to set date_range, preferring the post-event window (event_date to event_date + 7-10
+  days) over a whole month, so the imagery is close to the event itself.
 """
 
 
@@ -133,9 +125,6 @@ class PlannerAgent:
         # Validate minimal required fields
         _validate_plan(plan)
 
-        # Override hardcoded para eventos conocidos (seguridad si el LLM ignora el prompt)
-        _apply_known_event_overrides(plan, state["user_query"])
-
         # Post-process: para análisis de inundaciones/agua en ciudades costeras,
         # recortar el bbox para que no se extienda más de 0.3° al este del centroide
         _clip_bbox_inland(plan)
@@ -162,52 +151,6 @@ class PlannerAgent:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-DANA_KEYWORDS = {
-    "dana", "paiporta", "catarroja", "alfafar", "massanassa", "benetússer",
-    "l'horta", "horta sud", "inundacion", "inundación", "riada", "flood",
-}
-
-def _apply_known_event_overrides(plan: dict, query: str) -> None:
-    """
-    Fuerza parámetros correctos para eventos conocidos con independencia de lo
-    que genere el LLM. Actualmente cubre: DANA Valencia octubre 2024.
-    """
-    q = query.lower()
-    is_dana = any(kw in q for kw in DANA_KEYWORDS) and (
-        "valencia" in q or "dana" in q or "2024" in q
-    )
-    if not is_dana:
-        return
-
-    DANA_BBOX      = [-0.55, 39.30, -0.25, 39.55]
-    DANA_START     = "2024-10-30"
-    DANA_END       = "2024-11-10"
-    DANA_INDICES   = ["NDWI", "MNDWI", "AWEI"]
-    DANA_CLOUD_MAX = 60
-
-    loc = plan.setdefault("location", {})
-    loc["bbox"] = DANA_BBOX
-    if loc.get("centroid"):
-        loc["centroid"] = [-0.40, 39.42]
-
-    dr = plan.setdefault("date_range", {})
-    dr["start"] = DANA_START
-    dr["end"]   = DANA_END
-
-    plan["analysis_type"]    = "flood"
-    plan["cloud_cover_max"]  = DANA_CLOUD_MAX
-
-    existing = {i.upper() for i in plan.get("required_indices", [])}
-    for idx in DANA_INDICES:
-        if idx not in existing:
-            plan.setdefault("required_indices", []).append(idx)
-
-    logger.info(
-        "[Planner] DANA override aplicado: bbox=%s  dates=%s→%s  indices=%s",
-        DANA_BBOX, DANA_START, DANA_END, plan["required_indices"],
-    )
-
-
 def _clip_bbox_inland(plan: dict) -> None:
     """
     Para análisis de inundaciones/agua, recorta el bbox para que no se extienda

@@ -61,6 +61,13 @@ report that a non-technical user can understand.
 - Keep each section concise but informative.
 - Use markdown formatting (headers, bold, bullet lists).
 
+## General principle: pixel-based evidence over area averages
+This applies to EVERY analysis type, not just floods. A real localized phenomenon (a flood, a burn
+scar, an urban expansion, snow melt) is usually a fraction of a larger, mostly-unaffected bounding
+box — a single area-wide mean dilutes it away. Whenever INDEX_EXTENT / INDEX_CHANGE / SAR_CHANGE
+statistics are present in the data (see below), treat their pixel percentages as the primary
+evidence, and treat the plain area-wide mean/std of each index as secondary, supporting context.
+
 ## NDVI interpretation guide
 < 0.1  : Bare soil, rock, urban, water
 0.1–0.2: Sparse vegetation, degraded land
@@ -69,18 +76,18 @@ report that a non-technical user can understand.
 > 0.6  : Very dense vegetation (tropical forest)
 
 ## NDWI interpretation (standard: clear water)
-< -0.1 : Dry land / dense vegetation — no flooding
--0.1–0 : Possibly saturated soil or turbid flood water (mud, sediment)
+< -0.1 : Dry land / dense vegetation — no water signal
+-0.1–0 : Possibly saturated soil or turbid water (mud, sediment) — AMBIGUOUS, needs confirmation
 0–0.2  : Probable open water or very wet soil / flooded fields
 > 0.2  : Confirmed open water
 
-## NDWI interpretation for FLOOD events with TURBID water (e.g. flash floods, DANA storms)
-IMPORTANT: Flash flood water carries mud and sediment, raising SWIR reflectance and lowering NDWI.
-For these events use LOWER thresholds:
-  NDWI > -0.1   → possible turbid flood water
-  NDWI > 0.0    → likely flooded (turbid or mixed water/soil)
-  NDWI > 0.15   → confirmed standing water
-If analysis_type is "flood", use these lower thresholds instead of the standard ones.
+## Context: turbid flood water (flood analyses only)
+Flash flood water (e.g. DANA-type storms) carries mud and sediment, which raises SWIR reflectance
+and can suppress the NDWI signal compared to clear water. This means a moderately negative NDWI
+(between -0.1 and 0) is AMBIGUOUS on its own — it could be dry soil OR turbid flood water. Do NOT
+resolve this ambiguity by assumption or by picking the more dramatic conclusion. Instead, rely on
+the INDEX_EXTENT, SAR_CHANGE and INDEX_CHANGE statistics described below — these report the actual
+measured percentage of pixels with a water/flood signature, which is the reliable evidence.
 
 ## MNDWI interpretation (better for turbid/muddy water)
 < -0.1 : Dry land
@@ -97,16 +104,91 @@ If analysis_type is "flood", use these lower thresholds instead of the standard 
 0–0.2  : Mixed urban/vegetation
 > 0.2  : Built-up area dominated
 
-## CRITICAL for flood analysis
-When analysis_type is "flood" and NDWI mean is between -0.15 and 0.1:
-- Do NOT conclude "no flooding detected"
-- Instead, report that TURBID FLOOD WATER is likely present (mud suppresses NDWI signal)
-- Compare NDWI to expected baseline for the region (typically -0.3 to -0.2 for dry agricultural land in Valencia)
-- A shift of +0.1 or more in NDWI from the dry baseline IS evidence of flooding
-- Use MNDWI and AWEI results to confirm if available
+## NBR / burn severity (fire analyses)
+NBR alone is not diagnostic — burn severity needs the CHANGE in NBR (pre-event minus post-event,
+i.e. NBR drops after a fire). If INDEX_CHANGE includes nbr_pct_low_severity_burn /
+nbr_pct_high_severity_burn, use those percentages, not the plain NBR mean.
+
+## NDSI (snow analyses)
+> 0.4  : Likely snow/ice covered.
+Note: NDSI uses the same band ratio as MNDWI (green/SWIR1) — snow and turbid water can look similar
+without extra context (e.g. temperature, season). Treat with some caution in mixed scenes.
+
+## INDEX_EXTENT / INDEX_CHANGE / SAR_CHANGE (pixel-based evidence, any analysis type)
+When present in the data, these report the ACTUAL MEASURED percentage of pixels in the study area
+crossing a meaningful threshold for the relevant index — far more reliable than a single area-wide
+mean, because the real phenomenon is usually localized within a larger, mostly-unaffected bounding
+box and gets diluted away in a simple average.
+- If these percentages are low (a few % or less) and the area-wide means are ambiguous, the correct
+  conclusion is that there is little to no evidence of the phenomenon in the analyzed scene — say so
+  plainly.
+- If these percentages are substantial (tens of %), report that as clear evidence.
+- If sources disagree (e.g. SAR shows change but optical indices don't, or vice versa), report that
+  disagreement transparently instead of silently picking the conclusion that seems more dramatic.
+- Any stat named "pct_area_valid" tells you what fraction of the AOI actually has usable data (the
+  rest was cloud/shadow and is unknown, not "unaffected") — always mention this coverage limit.
+- Any stat suffixed "_excl_urban" excludes pixels with a built-up spectral signature, which is a
+  known source of false water/flood positives in NDWI/MNDWI — prefer it over the unfiltered version.
+
+## CRITICAL RULE
+Never state a conclusion the numbers do not support. Base your conclusion strictly on the computed
+statistics actually provided (area means AND pixel percentages), and say explicitly when the
+evidence is weak, absent, or contradictory. Do not invent or assume a baseline value that was not
+measured from the data provided.
 
 Your response must be written in Spanish.
 """
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Helpers de evidencia — genéricos, no dependen de analysis_type
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _format_evidence_block(title: str, stats: dict, note: str = "") -> str:
+    """Convierte un dict de estadísticas en texto legible para inyectar en el
+    prompt del LLM. Genérico: funciona para cualquier índice o analysis_type,
+    no solo inundación."""
+    if not stats:
+        return ""
+    lines = [f"\n\n{title}:"]
+    pct_area_valid = stats.get("pct_area_valid")
+    if pct_area_valid is not None:
+        lines.append(
+            f"  · IMPORTANTE — cobertura: solo el {pct_area_valid}% del área pudo evaluarse "
+            "(el resto quedó fuera por nubes/sombras u otra falta de dato). Los demás porcentajes "
+            "de este bloque son relativos a esa área válida, NO al área total."
+        )
+    for key, value in stats.items():
+        if key == "pct_area_valid":
+            continue
+        suffix = "%" if "pct" in key else ""
+        lines.append(f"  · {key}: {value}{suffix}")
+    if note:
+        lines.append(note)
+    return "\n".join(lines)
+
+
+def _build_evidence_table_md(computed_indices: dict) -> str:
+    """Tabla con TODOS los valores calculados, generada directamente desde los
+    datos (no por el LLM) para que ningún número se pierda en el resumen —
+    válido para cualquier tipo de análisis."""
+    if not computed_indices:
+        return ""
+    lines = [
+        "\n\n## Tabla de Evidencia (datos completos)\n",
+        "| Fuente | Estadística | Valor |",
+        "|---|---|---|",
+    ]
+    for source_name, stats in computed_indices.items():
+        if not isinstance(stats, dict):
+            continue
+        for stat_name, value in stats.items():
+            if isinstance(value, float):
+                value_str = f"{value:.4f}" if abs(value) < 10 else f"{value:.2f}"
+            else:
+                value_str = str(value)
+            lines.append(f"| {source_name} | {stat_name} | {value_str} |")
+    return "\n".join(lines) + "\n"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,41 +232,60 @@ class ReporterAgent:
             "output_files":  output_files,
         }
 
-        flood_note = ""
-        if analysis_type == "flood":
-            sar_available    = state.get("sar_available") or False
-            pre_scene_files  = state.get("pre_scene_files") or []
-            sar_stats        = computed_indices.get("SAR_CHANGE", {})
+        # Evidencia por píxel — genérica, se aplica a CUALQUIER analysis_type,
+        # no solo inundación (INDEX_EXTENT/INDEX_CHANGE se calculan siempre que
+        # haya bandas ópticas legibles; SAR_CHANGE solo existe para inundación).
+        index_extent  = computed_indices.get("INDEX_EXTENT", {})
+        index_change  = computed_indices.get("INDEX_CHANGE", {})
+        sar_stats     = computed_indices.get("SAR_CHANGE", {})
+        sar_available = state.get("sar_available") or False
 
-            if sar_available and sar_stats:
-                sar_block = (
-                    f"\n\nSentinel-1 SAR Change Detection (penetra nubes — detecta agua turbia):\n"
-                    f"  · Cambio medio de retrodispersión: {sar_stats.get('mean_change_dB', '?')} dB\n"
-                    f"  · Área con posible inundación (Δ < -3 dB): {sar_stats.get('pct_possible_flood', '?')}%\n"
-                    f"  · Área con inundación confirmada (Δ < -5 dB): {sar_stats.get('pct_confirmed_flood', '?')}%\n"
-                    "Incluye una sección dedicada SAR en el informe explicando qué significa cada umbral. "
-                    "Destaca que SAR es inmune a nubes y agua turbia — supera las limitaciones del NDWI óptico."
-                )
-            else:
-                sar_block = (
-                    "\n\nNota: Datos Sentinel-1 SAR no disponibles para este evento. "
-                    "La extensión de la inundación se basa únicamente en índices ópticos."
-                )
+        evidence_note = ""
+        if index_extent:
+            evidence_note += _format_evidence_block(
+                "Evidencia por píxel en la escena analizada (NO es una media de área — evita "
+                "que una señal localizada se diluya)",
+                index_extent,
+                note=(
+                    "Los stats '_excl_urban' descuentan confusión con zonas edificadas en "
+                    "NDWI/MNDWI (limitación conocida) — son más fiables que la versión sin filtrar."
+                ),
+            )
+        if index_change:
+            evidence_note += _format_evidence_block(
+                "Cambio real pre/post evento (comparación con una escena Sentinel-2 previa "
+                "real, NO un baseline asumido)",
+                index_change,
+            )
+        if sar_available and sar_stats:
+            evidence_note += (
+                "\n\nSentinel-1 SAR Change Detection (penetra nubes — detecta agua turbia):\n"
+                f"  · Cambio medio de retrodispersión: {sar_stats.get('mean_change_dB', '?')} dB\n"
+                f"  · Área con posible inundación (Δ < -3 dB): {sar_stats.get('pct_possible_flood', '?')}%\n"
+                f"  · Área con inundación confirmada (Δ < -5 dB): {sar_stats.get('pct_confirmed_flood', '?')}%\n"
+                "Incluye una sección dedicada SAR en el informe explicando qué significa cada umbral."
+            )
+        elif analysis_type == "flood":
+            evidence_note += (
+                "\n\nNota: Datos Sentinel-1 SAR no disponibles para este evento. "
+                "La extensión de la inundación se basa en los índices ópticos disponibles."
+            )
 
-            flood_note = (
-                "\n\nIMPORTANT: This is a FLOOD analysis. "
-                "Flash flood water is turbid (mud/sediment), which suppresses NDWI. "
-                "Use the TURBID WATER thresholds from your system prompt. "
-                "A typical dry Valencia agricultural baseline is NDWI ≈ -0.25. "
-                "Any shift above -0.10 is significant evidence of flooding."
-                + sar_block
+        if evidence_note:
+            evidence_note = (
+                "\n\nEvidencia cuantitativa adicional (calculada directamente sobre los datos, "
+                "independiente del código generado por el LLM analista). Basa tu conclusión "
+                "principalmente en los porcentajes de píxeles de abajo, no solo en la media de "
+                "área de cada índice. Si la evidencia es débil, inexistente o contradictoria "
+                "entre fuentes, dilo explícitamente en vez de forzar una conclusión."
+                + evidence_note
             )
 
         prompt = (
             f"Generate a report based on the following analysis results:\n\n"
             f"```json\n{json.dumps(context, indent=2, ensure_ascii=False)}\n```\n\n"
             f"Original user question: \"{state['user_query']}\"\n"
-            f"{flood_note}\n\n"
+            f"{evidence_note}\n\n"
             f"Respond with a complete Markdown report."
         )
 
@@ -195,6 +296,9 @@ class ReporterAgent:
             ]
         )
         report_md = response.content.strip()
+        # Tabla determinista con TODOS los valores calculados — no depende de que
+        # el LLM decida mencionarlos (ver _build_evidence_table_md).
+        report_md += _build_evidence_table_md(computed_indices)
 
         # ── Generate interactive Folium map ────────────────────────────────
         map_html = _build_folium_map(

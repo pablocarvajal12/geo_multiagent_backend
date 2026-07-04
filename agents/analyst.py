@@ -108,6 +108,7 @@ EVI   = 2.5*(NIR-RED)/(NIR+6*RED-7.5*BLUE+1+1e-10)               → clip [-1, 1
 SAVI  = 1.5*(NIR-RED)/(NIR+RED+0.5)                               → clip [-1, 1]
 NDWI  = (GREEN - NIR) / (GREEN + NIR + 1e-10)                     → clip [-1, 1]
 MNDWI = (GREEN - SWIR1) / (GREEN + SWIR1 + 1e-10)                 → clip [-1, 1]
+AWEI  = 4*(GREEN - SWIR1) - (0.25*NIR + 2.75*SWIR2)               → clip [-1, 1]  (AWEInsh, no-shadow variant)
 NDBI  = (SWIR1 - NIR) / (SWIR1 + NIR + 1e-10)                     → clip [-1, 1]
 NBR   = (NIR - SWIR2) / (NIR + SWIR2 + 1e-10)                     → clip [-1, 1]
 LAI   = 3.618 * EVI - 0.118                                        → clip [0, 8]
@@ -377,14 +378,18 @@ def _python_fallback_compute(
     _save_rgb_composite(bands, is_synthetic=is_synthetic, scene_info=None)
 
     NIR, RED, GREEN = bands["NIR"], bands["RED"], bands["GREEN"]
-    BLUE, SWIR1 = bands["BLUE"], bands["SWIR1"]
+    BLUE, SWIR1, SWIR2 = bands["BLUE"], bands["SWIR1"], bands["SWIR2"]
 
     INDEX_FORMULAS = {
         "NDVI":  (NIR - RED)   / (NIR + RED   + 1e-10),
         "EVI":   2.5*(NIR-RED) / (NIR + 6*RED - 7.5*BLUE + 1 + 1e-10),
         "SAVI":  1.5*(NIR-RED) / (NIR + RED   + 0.5),
         "NDWI":  (GREEN - NIR) / (GREEN + NIR  + 1e-10),
+        "MNDWI": (GREEN - SWIR1) / (GREEN + SWIR1 + 1e-10),
+        "AWEI":  4*(GREEN-SWIR1) - (0.25*NIR + 2.75*SWIR2),
         "NDBI":  (SWIR1 - NIR) / (SWIR1 + NIR  + 1e-10),
+        "NBR":   (NIR - SWIR2) / (NIR + SWIR2 + 1e-10),
+        "NDSI":  (GREEN - SWIR1) / (GREEN + SWIR1 + 1e-10),
     }
     CMAPS = {"NDWI": "RdYlBu", "NDBI": "RdYlBu"}
 
@@ -559,6 +564,321 @@ def _sar_flood_analysis(
     logger.info("[SAR] Análisis completado — posible %.1f%%, confirmado %.1f%%",
                 pct_possible, pct_confirmed)
     return {"SAR_CHANGE": stats}, output_files
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Máscara de nubes/sombras a partir de la banda SCL (Scene Classification Layer)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Clases SCL consideradas superficie válida para CUALQUIER índice espectral:
+# 4=vegetación, 5=suelo desnudo, 6=agua, 7=sin clasificar, 11=nieve/hielo.
+# Se excluyen: 0=nodata, 1=saturado/defectuoso, 2=área oscura (sombra ambigua),
+# 3=sombra de nube, 8/9=nube prob. media/alta, 10=cirro fino — todas ellas
+# distorsionan cualquier índice (no solo los de agua) si no se filtran.
+_VALID_SCL_CLASSES = {4, 5, 6, 7, 11}
+
+
+def _read_scl_valid_mask(path: str, target: int = 512) -> Optional["np.ndarray"]:
+    """Lee la banda SCL y devuelve una máscara booleana: True = píxel de superficie
+    válido, False = nube, sombra, nodata o saturado."""
+    try:
+        import numpy as np
+        import rasterio
+        from rasterio.enums import Resampling
+
+        with rasterio.open(path) as src:
+            h = min(target, src.height)
+            w = min(target, src.width)
+            # nearest: SCL es una capa categórica, promediar clases no tiene sentido
+            scl = src.read(1, out_shape=(h, w), resampling=Resampling.nearest)
+        return np.isin(scl, list(_VALID_SCL_CLASSES))
+    except Exception as exc:
+        logger.warning("[CloudMask] No se pudo leer SCL %s: %s", path, exc)
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Lectura de bandas + fórmulas de índices — compartido por extent y change
+# ─────────────────────────────────────────────────────────────────────────────
+
+_INDEX_BAND_SUFFIXES = {"B02": "BLUE", "B03": "GREEN", "B04": "RED",
+                         "B08": "NIR", "B11": "SWIR1", "B12": "SWIR2"}
+
+
+def _read_optical_bands(files: list, target: int = 512) -> dict:
+    """Lee todas las bandas ópticas reconocidas disponibles en una lista de
+    ficheros descargados. Ignora SCL y bandas SAR (de otro sensor/fase)."""
+    import numpy as np
+    import rasterio
+    from rasterio.enums import Resampling
+
+    bands: dict = {}
+    for path in (files or []):
+        if "_pre_VV" in path or "_post_VV" in path:
+            continue  # bandas SAR, no ópticas
+        for suffix, band_name in _INDEX_BAND_SUFFIXES.items():
+            if path.endswith(f"_{suffix}.tif") and band_name not in bands:
+                try:
+                    with rasterio.open(path) as src:
+                        h = min(target, src.height)
+                        w = min(target, src.width)
+                        arr = src.read(1, out_shape=(h, w),
+                                       resampling=Resampling.average).astype(np.float32)
+                    arr[arr <= 0] = np.nan
+                    arr /= 10000.0
+                    bands[band_name] = arr
+                except Exception as exc:
+                    logger.warning("No se pudo leer %s: %s", path, exc)
+    return bands
+
+
+def _compute_index_array(index_name: str, bands: dict) -> Optional["np.ndarray"]:
+    """Calcula el array de un índice a partir de bandas ya leídas (GREEN, NIR,
+    RED, BLUE, SWIR1, SWIR2). Devuelve None si faltan bandas necesarias."""
+    import numpy as np
+    eps = 1e-10
+    try:
+        if index_name == "NDVI":
+            return np.clip((bands["NIR"] - bands["RED"]) / (bands["NIR"] + bands["RED"] + eps), -1, 1)
+        if index_name == "EVI":
+            return np.clip(2.5 * (bands["NIR"] - bands["RED"]) /
+                            (bands["NIR"] + 6 * bands["RED"] - 7.5 * bands["BLUE"] + 1 + eps), -1, 1)
+        if index_name == "SAVI":
+            return np.clip(1.5 * (bands["NIR"] - bands["RED"]) / (bands["NIR"] + bands["RED"] + 0.5), -1, 1)
+        if index_name == "NDWI":
+            return np.clip((bands["GREEN"] - bands["NIR"]) / (bands["GREEN"] + bands["NIR"] + eps), -1, 1)
+        if index_name == "MNDWI":
+            return np.clip((bands["GREEN"] - bands["SWIR1"]) / (bands["GREEN"] + bands["SWIR1"] + eps), -1, 1)
+        if index_name == "AWEI":
+            return np.clip(4 * (bands["GREEN"] - bands["SWIR1"]) -
+                            (0.25 * bands["NIR"] + 2.75 * bands["SWIR2"]), -2, 2)
+        if index_name == "NDBI":
+            return np.clip((bands["SWIR1"] - bands["NIR"]) / (bands["SWIR1"] + bands["NIR"] + eps), -1, 1)
+        if index_name == "NBR":
+            return np.clip((bands["NIR"] - bands["SWIR2"]) / (bands["NIR"] + bands["SWIR2"] + eps), -1, 1)
+        if index_name == "NDSI":
+            # Misma fórmula que MNDWI (verde/SWIR1) — limitación conocida: sin más
+            # contexto, nieve y agua turbia pueden dar una señal parecida.
+            return np.clip((bands["GREEN"] - bands["SWIR1"]) / (bands["GREEN"] + bands["SWIR1"] + eps), -1, 1)
+    except KeyError:
+        return None
+    return None
+
+
+# Umbrales de NIVEL (una sola escena): {índice: [(etiqueta, operador, valor), ...]}
+INDEX_LEVEL_THRESHOLDS: dict = {
+    "NDWI":  [("probable_water", ">", -0.10), ("confirmed_water", ">", 0.15)],
+    "MNDWI": [("water", ">", 0.0)],
+    "AWEI":  [("water", ">", 0.0)],
+    "NDVI":  [("vegetated", ">", 0.2)],
+    "NDBI":  [("built_up", ">", 0.2)],
+    "NDSI":  [("snow", ">", 0.4)],
+}
+
+# Umbrales de CAMBIO real pre/post evento. El signo importa: agua/urbano nuevo
+# = aumento; pérdida de vegetación/nieve y severidad de quemado = descenso
+# (el dNBR clásico se define como NBR-pre menos NBR-post, es decir cae tras un incendio).
+INDEX_CHANGE_THRESHOLDS: dict = {
+    "NDWI":  [("probable_new_water", ">", 0.10), ("confirmed_new_water", ">", 0.15)],
+    "NDBI":  [("new_built_up", ">", 0.15)],
+    "NDVI":  [("vegetation_loss", "<", -0.15), ("vegetation_gain", ">", 0.15)],
+    "NBR":   [("low_severity_burn", "<", -0.10), ("high_severity_burn", "<", -0.27)],
+    "NDSI":  [("snow_loss", "<", -0.20)],
+}
+
+_EXTENT_CANDIDATE_INDICES = tuple(INDEX_LEVEL_THRESHOLDS.keys())
+_CHANGE_CANDIDATE_INDICES = tuple(INDEX_CHANGE_THRESHOLDS.keys())
+
+
+def _apply_threshold(array: "np.ndarray", op: str, value: float):
+    return array > value if op == ">" else array < value
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Extensión por píxel — evidencia independiente del código del LLM
+#  Vale para cualquier tipo de análisis (agua, vegetación, urbano, fuego, nieve),
+#  no solo inundaciones: evita que una señal localizada se diluya en la media
+#  de un bbox grande, y enmascara nubes/sombras con SCL cuando está disponible.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _index_extent_analysis(
+    downloaded_files: list,
+    outputs_dir: Path,
+) -> tuple[dict, list]:
+    try:
+        import numpy as np
+        from PIL import Image
+        import matplotlib
+    except ImportError as exc:
+        logger.warning("[IndexExtent] Dependencia no disponible: %s", exc)
+        return {}, []
+
+    bands = _read_optical_bands(downloaded_files)
+    if not bands:
+        logger.warning("[IndexExtent] Sin bandas ópticas legibles — se omite")
+        return {}, []
+
+    total_scene_pixels = int(next(iter(bands.values())).size)
+
+    arrays: dict = {}
+    for idx_name in _EXTENT_CANDIDATE_INDICES:
+        arr = _compute_index_array(idx_name, bands)
+        if arr is not None:
+            arrays[idx_name] = arr
+
+    if not arrays:
+        logger.warning("[IndexExtent] Ningún índice calculable con las bandas disponibles (%s)",
+                        list(bands.keys()))
+        return {}, []
+
+    valid = np.ones(next(iter(arrays.values())).shape, dtype=bool)
+    for arr in arrays.values():
+        valid &= ~np.isnan(arr)
+
+    scl_path = next((f for f in (downloaded_files or []) if f.endswith("_SCL.tif")), None)
+    if scl_path:
+        cloud_mask = _read_scl_valid_mask(scl_path)
+        if cloud_mask is not None:
+            h = min(valid.shape[0], cloud_mask.shape[0])
+            w = min(valid.shape[1], cloud_mask.shape[1])
+            valid = valid[:h, :w] & cloud_mask[:h, :w]
+            arrays = {k: v[:h, :w] for k, v in arrays.items()}
+            logger.info("[IndexExtent] Máscara SCL aplicada — %.1f%% píxeles válidos tras filtrar nubes/sombras",
+                        float(np.mean(cloud_mask[:h, :w])) * 100)
+    else:
+        logger.warning("[IndexExtent] Banda SCL no disponible — no se filtran nubes/sombras")
+
+    total = int(np.sum(valid)) or 1
+    not_urban = None
+    if "NDBI" in arrays:
+        not_urban = ~_apply_threshold(arrays["NDBI"], ">", 0.0)  # NDBI>0 → superficie edificada
+
+    stats: dict = {"pct_area_valid": round(total / total_scene_pixels * 100, 2)}
+    for idx_name, thresholds in INDEX_LEVEL_THRESHOLDS.items():
+        arr = arrays.get(idx_name)
+        if arr is None:
+            continue
+        prefix = idx_name.lower()
+        for label, op, value in thresholds:
+            mask = valid & _apply_threshold(arr, op, value)
+            stats[f"{prefix}_pct_{label}"] = round(float(np.sum(mask)) / total * 100, 2)
+            # NDWI/MNDWI confunden superficie edificada con agua (limitación conocida)
+            if idx_name in ("NDWI", "MNDWI") and not_urban is not None:
+                stats[f"{prefix}_pct_{label}_excl_urban"] = round(
+                    float(np.sum(mask & not_urban)) / total * 100, 2)
+    if "NDBI" in arrays:
+        stats["pct_urban_like"] = round(
+            float(np.sum(valid & _apply_threshold(arrays["NDBI"], ">", 0.0))) / total * 100, 2)
+
+    output_files: list = []
+    if "NDWI" in arrays:
+        mask_path = outputs_dir / "water_extent_mask.png"
+        try:
+            confirmed = valid & (arrays["NDWI"] > 0.15)
+            if "MNDWI" in arrays:
+                confirmed = confirmed & (arrays["MNDWI"] > 0.0)
+            probable = valid & (arrays["NDWI"] > -0.10) & ~confirmed
+            mask_rgb = np.full((*arrays["NDWI"].shape, 3), 180, dtype=np.uint8)  # gris = sin evidencia
+            mask_rgb[probable]  = [255, 200, 0]    # amarillo = posible agua turbia
+            mask_rgb[confirmed] = [0,   100, 200]  # azul = agua confirmada
+            mask_rgb[~valid]    = [0,   0,   0]
+            Image.fromarray(mask_rgb, "RGB").save(str(mask_path))
+            output_files.append(str(mask_path))
+        except Exception as exc:
+            logger.warning("[IndexExtent] No se pudo guardar water_extent_mask.png: %s", exc)
+
+    logger.info("[IndexExtent] índices=%s stats=%s", list(arrays.keys()), stats)
+    return {"INDEX_EXTENT": stats}, output_files
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Cambio real pre/post evento (Sentinel-2, sin baseline asumido)
+#  Generaliza el cambio óptico a cualquier índice calculable (no solo NDWI):
+#  compara una escena real previa despejada con la escena post-evento, en vez
+#  de asumir un valor de referencia fijo.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _index_change_analysis(
+    pre_files: list,
+    post_files: list,
+    outputs_dir: Path,
+) -> tuple[dict, list]:
+    try:
+        import numpy as np
+        from PIL import Image
+        import matplotlib
+    except ImportError as exc:
+        logger.warning("[IndexChange] Dependencia no disponible: %s", exc)
+        return {}, []
+
+    pre_bands  = _read_optical_bands(pre_files)
+    post_bands = _read_optical_bands(post_files)
+    if not pre_bands or not post_bands:
+        logger.warning("[IndexChange] Bandas pre y/o post no disponibles — se omite")
+        return {}, []
+
+    changes: dict = {}
+    for idx_name in _CHANGE_CANDIDATE_INDICES:
+        pre_arr  = _compute_index_array(idx_name, pre_bands)
+        post_arr = _compute_index_array(idx_name, post_bands)
+        if pre_arr is None or post_arr is None:
+            continue
+        h = min(pre_arr.shape[0], post_arr.shape[0])
+        w = min(pre_arr.shape[1], post_arr.shape[1])
+        changes[idx_name] = post_arr[:h, :w] - pre_arr[:h, :w]
+
+    if not changes:
+        logger.warning("[IndexChange] Ningún índice de cambio calculable con las bandas disponibles")
+        return {}, []
+
+    h = min(arr.shape[0] for arr in changes.values())
+    w = min(arr.shape[1] for arr in changes.values())
+    changes = {k: v[:h, :w] for k, v in changes.items()}
+    total_scene_pixels = h * w
+
+    valid = np.ones((h, w), dtype=bool)
+    for arr in changes.values():
+        valid &= ~np.isnan(arr)
+
+    # Enmascarar nubes/sombras en AMBAS fechas — un píxel solo es válido si está
+    # despejado tanto en la escena pre-evento como en la post-evento.
+    pre_scl_path  = next((f for f in pre_files  if f.endswith("_SCL.tif")), None)
+    post_scl_path = next((f for f in post_files if f.endswith("_SCL.tif")), None)
+    if pre_scl_path and post_scl_path:
+        pre_mask  = _read_scl_valid_mask(pre_scl_path)
+        post_mask = _read_scl_valid_mask(post_scl_path)
+        if pre_mask is not None and post_mask is not None:
+            hh = min(valid.shape[0], pre_mask.shape[0], post_mask.shape[0])
+            ww = min(valid.shape[1], pre_mask.shape[1], post_mask.shape[1])
+            valid = valid[:hh, :ww] & pre_mask[:hh, :ww] & post_mask[:hh, :ww]
+            changes = {k: v[:hh, :ww] for k, v in changes.items()}
+    else:
+        logger.warning("[IndexChange] Banda SCL no disponible en pre y/o post — no se filtran nubes/sombras")
+
+    total = int(np.sum(valid)) or 1
+
+    stats: dict = {"pct_area_valid": round(total / total_scene_pixels * 100, 2)}
+    output_files: list = []
+    for idx_name, change_arr in changes.items():
+        prefix = idx_name.lower()
+        stats[f"{prefix}_mean_change"] = round(float(np.mean(change_arr[valid])), 4)
+        for label, op, value in INDEX_CHANGE_THRESHOLDS.get(idx_name, []):
+            mask = valid & _apply_threshold(change_arr, op, value)
+            stats[f"{prefix}_pct_{label}"] = round(float(np.sum(mask)) / total * 100, 2)
+
+        if idx_name == "NDWI":
+            change_path = outputs_dir / "optical_ndwi_change.png"
+            try:
+                display = np.nan_to_num(change_arr, nan=0.0)
+                norm = np.clip((display + 0.5) / 1.0, 0.0, 1.0)
+                rgba = (matplotlib.colormaps["RdBu"](norm) * 255).astype(np.uint8)
+                Image.fromarray(rgba, "RGBA").save(str(change_path))
+                output_files.append(str(change_path))
+            except Exception as exc:
+                logger.warning("[IndexChange] No se pudo guardar optical_ndwi_change.png: %s", exc)
+
+    logger.info("[IndexChange] índices=%s stats=%s", list(changes.keys()), stats)
+    return {"INDEX_CHANGE": stats}, output_files
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -750,6 +1070,37 @@ class AnalystAgent:
                 logger.info("[Analyst] SAR índices fusionados: %s", list(sar_indices.keys()))
             else:
                 logger.warning("[Analyst] SAR no devolvió resultados (fallback óptico)")
+
+        # ── Extensión por píxel — siempre que haya bandas ópticas, para
+        # CUALQUIER tipo de análisis (no solo inundación): evita que una señal
+        # localizada (una inundación, un incendio, una mancha urbana) se diluya
+        # en la media de un bbox grande, y filtra nubes/sombras con SCL.
+        ie_indices, ie_files = _index_extent_analysis(downloaded, OUTPUTS_DIR)
+        if ie_indices:
+            computed_indices.update(ie_indices)
+            output_files.extend(ie_files)
+            logger.info("[Analyst] INDEX_EXTENT calculado: %s", ie_indices["INDEX_EXTENT"])
+        else:
+            logger.warning("[Analyst] INDEX_EXTENT no disponible (bandas insuficientes)")
+
+        # ── Cambio real pre/post (cualquier índice) ────────────────────────
+        pre_optical_files = state.get("pre_optical_files") or []
+        if pre_optical_files:
+            _RECOGNIZED_SUFFIXES = ("B02", "B03", "B04", "B08", "B11", "B12", "SCL")
+            post_optical_files = [
+                f for f in downloaded if any(f.endswith(f"_{s}.tif") for s in _RECOGNIZED_SUFFIXES)
+            ]
+            ic_indices, ic_files = _index_change_analysis(
+                pre_files=pre_optical_files,
+                post_files=post_optical_files,
+                outputs_dir=OUTPUTS_DIR,
+            )
+            if ic_indices:
+                computed_indices.update(ic_indices)
+                output_files.extend(ic_files)
+                logger.info("[Analyst] INDEX_CHANGE calculado: %s", ic_indices["INDEX_CHANGE"])
+            else:
+                logger.warning("[Analyst] INDEX_CHANGE no disponible")
 
         logger.info(
             "[Analyst] computed_indices=%s  output_files=%d  sar=%s  error=%s",

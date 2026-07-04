@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -170,7 +171,7 @@ def select_best_scene(scenes: list[dict], preference: str = "lowest_cloud") -> d
 
     Args:
         scenes: list of scene dicts (from search tools)
-        preference: "lowest_cloud" | "most_recent" | "best_coverage"
+        preference: "lowest_cloud" | "most_recent" | "earliest" | "best_coverage"
 
     Returns:
         The selected scene dict.
@@ -181,6 +182,10 @@ def select_best_scene(scenes: list[dict], preference: str = "lowest_cloud") -> d
     if preference == "most_recent":
         scenes_sorted = sorted(
             scenes, key=lambda s: s.get("date", ""), reverse=True
+        )
+    elif preference == "earliest":
+        scenes_sorted = sorted(
+            scenes, key=lambda s: s.get("date", "")
         )
     else:  # lowest_cloud (default)
         scenes_sorted = sorted(
@@ -250,6 +255,19 @@ def download_scene_bands(
             downloaded[band] = str(local_path)
             logger.info("[DataAcquisition] Downloaded %s → %s", band, local_path)
         except Exception as exc:
+            # Sin este log, una descarga fallida desaparecía en silencio y solo se
+            # detectaba muchos pasos despues (p.ej. "banda insuficiente" en el
+            # analista), sin ninguna pista de la causa real.
+            logger.warning("[DataAcquisition] Descarga fallida para banda %s: %s", band, exc)
+            # Si la descarga fallo a mitad de escritura, el fichero parcial se queda
+            # en disco y el chequeo "if local_path.exists()" de arriba lo trataria
+            # como valido (ya cacheado) en el siguiente intento, propagando un
+            # archivo corrupto indefinidamente.
+            if local_path.exists():
+                try:
+                    local_path.unlink()
+                except OSError:
+                    pass
             downloaded[band] = f"ERROR: {exc}"
 
     return downloaded
@@ -295,6 +313,21 @@ Your response must be written in Spanish.
 
 SENTINEL2_COLLECTIONS = ["sentinel-2-l2a"]
 LANDSAT_COLLECTIONS   = ["landsat-c2-l2"]
+
+_MGRS_TILE_RE = re.compile(r"_T(\d{2}[A-Z]{3})_")
+
+
+def _extract_mgrs_tile(scene_id: str) -> Optional[str]:
+    """
+    Extrae el tile MGRS (p.ej. '29TPG') del ID de una escena Sentinel-2
+    (formato S2B_MSIL2A_..._R137_T29TPG_...). Se usa para exigir que la
+    escena pre-evento caiga en el MISMO tile que la post-evento: regiones
+    grandes (p.ej. Galicia) pueden abarcar varios tiles, y comparar píxel a
+    píxel dos escenas de tiles distintos compara zonas geográficas distintas
+    aunque los arrays tengan las mismas dimensiones.
+    """
+    m = _MGRS_TILE_RE.search(scene_id or "")
+    return m.group(1) if m else None
 
 
 class DataAcquisitionAgent:
@@ -407,10 +440,13 @@ class DataAcquisitionAgent:
             }
 
         # 3. Seleccionar mejor escena
-        # Para índices de agua/inundación preferir la escena más reciente (captura el evento)
+        # Para índices de agua/inundación preferir la escena MÁS TEMPRANA dentro de la
+        # ventana post-evento (más cercana a la tormenta): el agua superficial suele
+        # drenar en pocos días, así que "most_recent" corría el riesgo de capturar la
+        # escena menos representativa de la inundación real.
         WATER_INDICES = {"NDWI", "MNDWI", "AWEI", "NDWI2", "WRI", "NDSI"}
         is_flood_query = bool(WATER_INDICES.intersection({i.upper() for i in indices}))
-        scene_preference = "most_recent" if is_flood_query else "lowest_cloud"
+        scene_preference = "earliest" if is_flood_query else "lowest_cloud"
         selected = select_best_scene.func(scenes=scenes, preference=scene_preference)
         logger.info(
             "[DataAcquisition] Selected scene: %s  preference=%s  cloud=%.1f%%  date=%s",
@@ -422,12 +458,18 @@ class DataAcquisitionAgent:
         band_map = {
             "NDVI": ["B04", "B08"], "EVI": ["B02", "B04", "B08"],
             "NDWI": ["B03", "B08"], "MNDWI": ["B03", "B11"],
+            "AWEI": ["B02", "B03", "B08", "B11", "B12"],
             "NDBI": ["B08", "B11"], "NBR":   ["B08", "B12"],
             "NDSI": ["B03", "B11"], "SAVI":  ["B04", "B08"],
         }
         bands_needed = set()
         for idx in indices:
             bands_needed.update(band_map.get(idx.upper(), ["B04", "B08"]))
+
+        # Descargar también SCL (Scene Classification Layer) SIEMPRE — permite
+        # enmascarar nubes/sombras antes de calcular CUALQUIER índice, no solo
+        # los de agua (las nubes/sombras distorsionan NDVI, NBR, NDSI, etc. igual).
+        bands_needed.add("SCL")
 
         # 5. Descargar bandas
         logger.info("[DataAcquisition] Downloading bands: %s", bands_needed)
@@ -438,10 +480,11 @@ class DataAcquisitionAgent:
 
         files = [v for v in downloaded.values() if not v.startswith("ERROR")]
 
-        # ── Sentinel-1 SAR (solo para análisis de inundación) ─────────────
+        # ── Sentinel-1 SAR (solo inundación — es una técnica específica de agua) ──
         pre_scene_files: list[str] = []
         sar_available: bool = False
         sar_note: str = "no solicitado"
+        pre_optical_files: list[str] = []
 
         if state.get("analysis_type") == "flood":
             logger.info("[DataAcquisition] Flood query — iniciando adquisición Sentinel-1 SAR")
@@ -455,13 +498,56 @@ class DataAcquisitionAgent:
             sar_note        = sar_result["note"]
             files.extend(sar_result["post_files"])
 
+        # ── Escena óptica pre-evento (para cambio real, no baseline asumido) ──
+        # Válido para CUALQUIER análisis con una fecha concreta, no solo inundación
+        # (deforestación, crecimiento urbano, deshielo, cicatriz de incendio...).
+        # Se omite solo para "general", donde no hay un evento claro que comparar.
+        if state.get("analysis_type") not in (None, "general"):
+            try:
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d")
+                end_dt   = datetime.strptime(end_date, "%Y-%m-%d")
+            except ValueError:
+                start_dt = end_dt = None
+
+            if start_dt is None:
+                pre_start = pre_end = None
+            elif state.get("analysis_type") == "flood":
+                # Evento puntual conocido: comparar contra una escena despejada de
+                # las semanas justo antes de la tormenta.
+                pre_start = (start_dt - timedelta(days=35)).strftime("%Y-%m-%d")
+                pre_end   = (start_dt - timedelta(days=10)).strftime("%Y-%m-%d")
+            else:
+                # Sin evento puntual: comparar contra el MISMO periodo del año
+                # anterior (con margen de ±15 días) para controlar la estacionalidad.
+                # Comparar verano-2024 contra primavera-2024 (unas semanas antes)
+                # confundiría el ciclo normal de secado estival con una pérdida real
+                # de vegetación — el mismo problema que dNBR tiene con el otoño.
+                pre_start = (start_dt - timedelta(days=365 + 15)).strftime("%Y-%m-%d")
+                pre_end   = (end_dt   - timedelta(days=365 - 15)).strftime("%Y-%m-%d")
+
+            if pre_start and pre_end:
+                pre_bands_needed = bands_needed & {"B02", "B03", "B04", "B08", "B11", "B12"}
+                pre_bands_needed.add("SCL")
+                logger.info(
+                    "[DataAcquisition] Adquiriendo escena óptica pre-evento (cambio real): "
+                    "ventana=%s→%s bandas=%s", pre_start, pre_end, pre_bands_needed,
+                )
+                pre_optical_result = _acquire_pre_event_optical(
+                    bbox=bbox, pre_start=pre_start, pre_end=pre_end, bands=list(pre_bands_needed),
+                    preferred_tile=_extract_mgrs_tile(selected.get("id", "")),
+                )
+                pre_optical_files = pre_optical_result["pre_optical_files"]
+                if pre_optical_result["pre_optical_available"]:
+                    sar_note += f" | {pre_optical_result['note']}"
+
         return {
-            "available_scenes":  scenes,
-            "selected_scene":    selected,
-            "downloaded_files":  files,
-            "pre_scene_files":   pre_scene_files,
-            "sar_available":     sar_available,
-            "current_agent":     "analyst",
+            "available_scenes":   scenes,
+            "selected_scene":     selected,
+            "downloaded_files":   files,
+            "pre_scene_files":    pre_scene_files,
+            "sar_available":      sar_available,
+            "pre_optical_files":  pre_optical_files,
+            "current_agent":      "analyst",
             "messages": [{"agent": "data_acquisition", "type": "status",
                         "content": (
                             f"Found {len(scenes)} scenes. Downloaded {len(files)} band files. "
@@ -580,6 +666,83 @@ def _acquire_sentinel1_sar(
         f"post: {post_scenes[0]['id'][:30]}… ({post_scenes[0]['date'][:10]})"
     )
     logger.info("[SAR] Adquisición completa — %s", result["note"])
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Sentinel-2 óptico pre-evento (para cambio NDWI real, sin baseline asumido)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _acquire_pre_event_optical(
+    bbox: list[float],
+    pre_start: str,
+    pre_end: str,
+    bands: list[str],
+    preferred_tile: Optional[str] = None,
+) -> dict:
+    """
+    Busca y descarga las bandas indicadas (las que necesiten los índices
+    solicitados, más SCL) de la escena Sentinel-2 más despejada dentro de la
+    ventana [pre_start, pre_end], para poder calcular un cambio real pre/post
+    en vez de comparar la media del área contra un baseline asumido.
+
+    La elección de esa ventana (corta antes de un evento puntual, o el mismo
+    periodo del año anterior para controlar estacionalidad) se decide en el
+    llamador, que es quien conoce el analysis_type — ver __call__.
+
+    Si se indica preferred_tile, se EXIGE que la escena pre-evento pertenezca
+    al mismo tile MGRS que la escena post-evento. Regiones grandes (p.ej.
+    Galicia) pueden abarcar varios tiles Sentinel-2; sin esta restricción, la
+    búsqueda podría devolver una escena de un tile distinto (simplemente por
+    tener menos nubes en esa ventana), y comparar píxel a píxel dos escenas de
+    tiles distintos compara zonas geográficas que no tienen relación entre sí,
+    aunque los arrays resultantes tengan las mismas dimensiones.
+
+    Returns dict con claves: pre_optical_files, pre_optical_available, note.
+    """
+    result: dict = {"pre_optical_files": [], "pre_optical_available": False, "note": ""}
+
+    search = search_planetary_computer.func(
+        bbox=bbox,
+        start_date=pre_start,
+        end_date=pre_end,
+        collections=["sentinel-2-l2a"],
+        cloud_cover_max=20,
+        limit=10,
+    )
+    scenes = search.get("items", [])
+    if not scenes:
+        result["note"] = f"Sin escenas S2 pre-evento despejadas ({pre_start}→{pre_end})"
+        logger.warning("[PreOptical] %s", result["note"])
+        return result
+
+    if preferred_tile:
+        same_tile = [s for s in scenes if _extract_mgrs_tile(s.get("id", "")) == preferred_tile]
+        if not same_tile:
+            result["note"] = (
+                f"Sin escena pre-evento en el mismo tile ({preferred_tile}) dentro de "
+                f"{pre_start}→{pre_end} — se omite la comparación para no comparar zonas distintas"
+            )
+            logger.warning("[PreOptical] %s", result["note"])
+            return result
+        scenes = same_tile
+
+    best = select_best_scene.func(scenes=scenes, preference="lowest_cloud")
+    downloaded = download_scene_bands.func(scene=best, bands=bands)
+    files = [v for v in downloaded.values() if not v.startswith("ERROR")]
+
+    if not files:
+        result["note"] = "Descarga de bandas ópticas pre-evento fallida"
+        logger.warning("[PreOptical] %s", result["note"])
+        return result
+
+    result["pre_optical_files"] = files
+    result["pre_optical_available"] = True
+    result["note"] = (
+        f"pre-óptico: {best['id'][:30]}… "
+        f"({best.get('date', '')[:10]}, nubes={best.get('cloud_cover', '?')}%)"
+    )
+    logger.info("[PreOptical] Adquisición completa — %s", result["note"])
     return result
 
 

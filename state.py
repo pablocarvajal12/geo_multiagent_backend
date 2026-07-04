@@ -43,6 +43,7 @@ class GeoAgentState(TypedDict):
     downloaded_files: Optional[list[str]]     # Rutas locales de los .tif descargados (S2 + SAR post)
     pre_scene_files: Optional[list[str]]      # Rutas SAR pre-evento para change detection
     sar_available: Optional[bool]             # True cuando SAR change detection está listo
+    pre_optical_files: Optional[list[str]]    # Rutas GREEN/NIR ópticas pre-evento para change detection
     acquisition_error: Optional[str]
 
     # ── Salidas del Agente Analista ──────────────────────────

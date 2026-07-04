@@ -60,7 +60,8 @@ cp .env.example .env
 ## Configuración `.env`
 
 ```dotenv
-ANTHROPIC_API_KEY=sk-ant-...      # Obligatorio
+GROQ_API_KEY=gsk_...              # Obligatorio (https://console.groq.com/keys)
+GROQ_MODEL=llama-3.3-70b-versatile # Opcional, valor por defecto
 
 # Opcional (amplía las fuentes de datos):
 COPERNICUS_USER=...
