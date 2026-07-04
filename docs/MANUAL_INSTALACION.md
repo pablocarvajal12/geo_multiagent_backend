@@ -32,7 +32,7 @@ Credenciales opcionales (amplían las fuentes de datos satelitales; sin ellas el
 ### 2.1 Clonar el repositorio
 
 ```bash
-git clone <url-del-repositorio> geo_multiagent_backend
+git clone https://github.com/pablocarvajal12/geo_multiagent_backend.git
 cd geo_multiagent_backend
 ```
 
@@ -99,7 +99,7 @@ Esto levanta el backend en `http://localhost:8000` (host y puerto configurables 
 ### 3.1 Clonar el repositorio
 
 ```bash
-git clone <url-del-repositorio-frontend> front_geo_multiagent
+git clone https://github.com/pablocarvajal12/front_geo_multiagent.git
 cd front_geo_multiagent
 ```
 
