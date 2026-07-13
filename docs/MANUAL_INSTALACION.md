@@ -18,10 +18,7 @@ Ambos proyectos son independientes: el backend expone una API REST + WebSocket, 
 | [Git](https://git-scm.com/) | Cualquiera | Clonar los repositorios |
 | Cuenta [Groq](https://console.groq.com/keys) | — | API key gratuita, obligatoria para el LLM |
 
-Credenciales opcionales (amplían las fuentes de datos satelitales; sin ellas el sistema usa Microsoft Planetary Computer, de acceso público):
-
-- [Copernicus Data Space Ecosystem](https://dataspace.copernicus.eu/) (usuario/contraseña)
-- [NASA Earthdata](https://urs.earthdata.nasa.gov/) (usuario/contraseña)
+Los datos satelitales se obtienen de catálogos STAC de acceso público (Microsoft Planetary Computer y Element84 Earth Search), por lo que no se necesita ninguna credencial adicional a la de Groq.
 
 > **Nota de seguridad:** nunca compartas ni subas a un repositorio público el archivo `.env` con tus claves reales. Usa siempre `.env.example` como plantilla.
 
@@ -54,7 +51,7 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Incluye LangGraph/LangChain, librerías geoespaciales (rasterio, geopandas, pyproj), FastAPI/Uvicorn y utilidades de procesamiento de datos. La instalación puede tardar varios minutos por el tamaño de las librerías geoespaciales.
+Incluye LangGraph/LangChain, librerías geoespaciales y de procesamiento (rasterio, numpy, matplotlib) y FastAPI/Uvicorn. La instalación puede tardar varios minutos por el tamaño de las librerías geoespaciales.
 
 ### 2.4 Configurar las variables de entorno
 
@@ -72,8 +69,6 @@ Edita `.env` y rellena como mínimo:
 GROQ_API_KEY=tu_clave_de_groq        # Obligatorio — https://console.groq.com/keys
 GROQ_MODEL=llama-3.3-70b-versatile   # Opcional, este es el valor por defecto
 ```
-
-Y, si dispones de ellas, las credenciales opcionales de Copernicus / Earthdata para ampliar las fuentes de datos satelitales.
 
 ### 2.5 Arrancar el servidor
 
@@ -139,7 +134,7 @@ npm run build      # genera los archivos estáticos en dist/
 npm run preview    # sirve esa build para comprobarla localmente
 ```
 
-Los archivos de `dist/` pueden desplegarse en cualquier servidor de archivos estáticos (Nginx, Netlify, GitHub Pages, el propio `serve_frontend.py` del backend, etc.), siempre que `API_BASE`/`WS_BASE` apunten a la URL pública del backend.
+Los archivos de `dist/` pueden desplegarse en cualquier servidor de archivos estáticos (Nginx, Netlify, GitHub Pages, etc.), siempre que `API_BASE`/`WS_BASE` apunten a la URL pública del backend.
 
 ---
 
@@ -158,6 +153,6 @@ Los archivos de `dist/` pueden desplegarse en cualquier servidor de archivos est
 |---|---|---|
 | El frontend muestra "No se pudo conectar con el servidor" | El backend no está arrancado o corre en otro host/puerto | Verifica `python main.py` y que `API_BASE`/`WS_BASE` en `main.js` coincidan |
 | Error instalando `rasterio` / `geopandas` en Windows | Falta de wheels precompiladas para tu versión de Python | Usa Python 3.12 (la versión probada) y una versión reciente de `pip` (`python -m pip install --upgrade pip`) antes de instalar `requirements.txt` |
-| El Analyst usa "datos sintéticos de demostración" | No hay credenciales de Copernicus/Earthdata configuradas | Es el comportamiento esperado sin esas credenciales; Planetary Computer (público) sigue funcionando igualmente |
+| El Analyst usa "datos sintéticos de demostración" | No se pudo descargar ninguna banda (sin conexión, catálogo STAC caído o ninguna escena en la ventana de fechas) | Comprueba la conexión y revisa el log de la adquisición; los catálogos (Planetary Computer, Earth Search) son públicos y no requieren credenciales |
 | `401`/`invalid_api_key` del LLM | `GROQ_API_KEY` ausente o incorrecta en `.env` | Genera una clave en [console.groq.com/keys](https://console.groq.com/keys) |
 | Puerto 8000 u 5173 ocupado | Otro proceso usando ese puerto | Cambia `APP_PORT` en `.env` (backend) o lanza Vite con `npm run dev -- --port <otro>` (frontend), actualizando `API_BASE`/`WS_BASE` en consecuencia |

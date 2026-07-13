@@ -1,6 +1,6 @@
 # GeoMultiAgent 🛰️
 
-Sistema multiagente basado en **LangGraph + Claude** para el análisis de datos de Observación de la Tierra mediante lenguaje natural.
+Sistema multiagente basado en **LangGraph**, con LLMs servidos por **Groq** (Llama 3.3 70B), para el análisis de datos de Observación de la Tierra mediante lenguaje natural.
 
 ## Arquitectura
 
@@ -42,46 +42,49 @@ Usuario (lenguaje natural)
 
 ```bash
 # 1. Clonar y entrar al proyecto
-cd geo_multiagent
+cd geo_multiagent_backend
 
 # 2. Crear entorno virtual
-python -m venv .venv
-source .venv/bin/activate   # Linux/macOS
-.venv\Scripts\activate      # Windows
+python -m venv venv
+source venv/bin/activate    # Linux/macOS
+venv\Scripts\activate       # Windows
 
 # 3. Instalar dependencias
 pip install -r requirements.txt
 
 # 4. Configurar credenciales
 cp .env.example .env
-# Edita .env y añade tu ANTHROPIC_API_KEY
+# Edita .env y añade tu GROQ_API_KEY
 ```
 
 ## Configuración `.env`
 
 ```dotenv
-GROQ_API_KEY=gsk_...              # Obligatorio (https://console.groq.com/keys)
+GROQ_API_KEY=gsk_...               # Obligatorio (https://console.groq.com/keys)
 GROQ_MODEL=llama-3.3-70b-versatile # Opcional, valor por defecto
-
-# Opcional (amplía las fuentes de datos):
-COPERNICUS_USER=...
-COPERNICUS_PASSWORD=...
-EARTHDATA_USERNAME=...
-EARTHDATA_PASSWORD=...
 ```
 
-> **Nota:** Sin credenciales de satélite, el Agente Analista usará datos sintéticos de demostración.
+> **Nota:** Los datos satelitales se obtienen de catálogos STAC públicos (Microsoft
+> Planetary Computer y Element84 Earth Search), sin necesidad de credenciales.
+> Si no se consigue descargar ninguna banda (p. ej. sin conexión), el Agente
+> Analista genera datos sintéticos de demostración para completar el pipeline.
 
 ## Uso
 
-### Interfaz Web
+### API (para el frontend web)
 
 ```bash
 python main.py
-# Abre http://localhost:8000
+# API en http://localhost:8000 — documentación Swagger en http://localhost:8000/docs
 ```
 
-### CLI
+La interfaz web (globo 3D con CesiumJS) vive en su propio repositorio,
+[`front_geo_multiagent`](https://github.com/pablocarvajal12/front_geo_multiagent),
+que consume esta API vía WebSocket (`/ws/{session_id}`) y REST
+(`/api/cesium-data/{session_id}`). Ver `docs/MANUAL_INSTALACION.md` para la
+puesta en marcha conjunta.
+
+### CLI (sin frontend)
 
 ```bash
 # Demo integrado
@@ -94,36 +97,23 @@ python cli.py "Analiza la deforestación en el estado de Pará, Brasil en 2023"
 python cli.py --demo --json
 ```
 
-### API REST
-
-```bash
-# Ejecutar análisis
-curl -X POST http://localhost:8000/api/query \
-  -H "Content-Type: application/json" \
-  -d '{"query": "Estado de la vegetación en Madrid, verano 2024"}'
-
-# WebSocket (streaming)
-# Ver frontend/index.html para ejemplo completo
-```
-
 ## Estructura del proyecto
 
 ```
-geo_multiagent/
+geo_multiagent_backend/
 ├── agents/
 │   ├── __init__.py
 │   ├── planner.py           # Agente planificador
 │   ├── data_acquisition.py  # Agente adquisición de datos
 │   ├── analyst.py           # Agente analista geoespacial
 │   └── reporter.py          # Agente generador de informes
-├── frontend/
-│   └── index.html           # Interfaz web
-├── data/                    # Bandas espectrales descargadas
-├── outputs/                 # Resultados (mapas, imágenes, informes)
+├── docs/
+│   └── MANUAL_INSTALACION.md
+├── data/                    # Bandas espectrales descargadas (generado en ejecución)
+├── outputs/                 # Resultados: mapas, imágenes, informes (generado en ejecución)
 ├── state.py                 # Definición del estado LangGraph
 ├── workflow.py              # Grafo LangGraph principal
 ├── backend.py               # API FastAPI + WebSocket
-├── serve_frontend.py        # Sirve el frontend desde FastAPI
 ├── main.py                  # Punto de entrada principal
 ├── cli.py                   # Interfaz de línea de comandos
 ├── requirements.txt

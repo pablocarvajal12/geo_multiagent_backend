@@ -1,8 +1,13 @@
 """
-backend.py – FastAPI Backend (corregido)
-- workflow.stream() corre en ThreadPoolExecutor para no bloquear el event loop
-- El estado final se guarda en disco como state_{session_id}.json
-- Endpoint GET /api/cesium-data/{session_id} devuelve datos listos para CesiumJS
+backend.py - API FastAPI del sistema GeoMultiAgent
+
+- WebSocket /ws/{session_id}: recibe la consulta, ejecuta el pipeline LangGraph
+  (síncrono) en un ThreadPoolExecutor para no bloquear el event loop, y envía
+  al cliente el log de agentes y el resultado final.
+- El estado final de cada sesión se persiste como outputs/state_{session_id}.json.
+- GET /api/cesium-data/{session_id}: devuelve los datos listos para el visor
+  CesiumJS (bbox, capas de índices y overlays de zonas afectadas, informe,
+  código generado).
 """
 from __future__ import annotations
 

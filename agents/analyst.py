@@ -1,11 +1,20 @@
 """
-agents/analyst.py – Geospatial Analyst Agent (corregido)
+agents/analyst.py - Agente Analista Geoespacial
 
-Cambios principales:
-- Prompt más estricto: exige siempre datos sintéticos si no hay archivos reales
-- _extract_code mejorado: maneja bloques con/sin lenguaje, strips de texto extra
-- Timeout en ejecución para no colgar el pipeline
-- Mejor log de errores para diagnóstico
+Genera con el LLM un script Python (numpy/rasterio/matplotlib) que calcula los
+índices espectrales solicitados, lo ejecuta capturando stdout/stderr y reintenta
+hasta MAX_CODE_ITERATIONS veces realimentando los errores al modelo.
+
+Complementa ese resultado con análisis deterministas, independientes del código
+generado por el LLM:
+- INDEX_EXTENT: extensión por píxel de cada índice con umbrales (filtro de
+  nubes/sombras vía banda SCL).
+- INDEX_CHANGE: cambio real pre/post evento contra una escena anterior.
+- SAR_CHANGE: detección de inundación por cambio de retrodispersión
+  Sentinel-1 (pre/post reproyectados a una malla común).
+- map_overlays: capas RGBA transparentes de zonas afectadas (agua, agua nueva,
+  fuego, vegetación, urbano, nieve) con sus bounds WGS-84 y leyenda, listas
+  para proyectarse en el visor CesiumJS.
 """
 from __future__ import annotations
 
