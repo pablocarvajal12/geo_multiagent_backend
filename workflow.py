@@ -173,6 +173,7 @@ def run_query(user_query: str, session_id: str | None = None) -> GeoAgentState:
         "execution_result":  None,
         "computed_indices":  None,
         "output_files":      None,
+        "map_overlays":      None,
         "code_iterations":   0,
         "analysis_error":    None,
         "report_markdown":   None,

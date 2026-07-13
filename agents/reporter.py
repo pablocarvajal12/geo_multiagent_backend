@@ -114,21 +114,45 @@ nbr_pct_high_severity_burn, use those percentages, not the plain NBR mean.
 Note: NDSI uses the same band ratio as MNDWI (green/SWIR1) — snow and turbid water can look similar
 without extra context (e.g. temperature, season). Treat with some caution in mixed scenes.
 
-## INDEX_EXTENT / INDEX_CHANGE / SAR_CHANGE (pixel-based evidence, any analysis type)
-When present in the data, these report the ACTUAL MEASURED percentage of pixels in the study area
-crossing a meaningful threshold for the relevant index — far more reliable than a single area-wide
-mean, because the real phenomenon is usually localized within a larger, mostly-unaffected bounding
-box and gets diluted away in a simple average.
-- If these percentages are low (a few % or less) and the area-wide means are ambiguous, the correct
-  conclusion is that there is little to no evidence of the phenomenon in the analyzed scene — say so
-  plainly.
-- If these percentages are substantial (tens of %), report that as clear evidence.
-- If sources disagree (e.g. SAR shows change but optical indices don't, or vice versa), report that
-  disagreement transparently instead of silently picking the conclusion that seems more dramatic.
+## Total extent vs. real change — CRITICAL when detecting an EVENT
+Two different families of pixel statistics may be present, and they mean very different things:
+- INDEX_EXTENT (…_pct_water, …_pct_built_up, …_pct_snow, …_pct_burn, etc.) = the TOTAL percentage of
+  pixels matching a signature in the post-event scene. This includes everything PERMANENT: for water
+  it counts the sea, lagoons, rivers and canals that were already there; for built-up it counts the
+  pre-existing city. A high total extent is NOT, by itself, evidence that an event happened.
+- INDEX_CHANGE (…_pct_new_water, …_pct_new_built_up, …_severity_burn, etc.) and SAR_CHANGE
+  (pct_confirmed_flood / pct_possible_flood) = the DIFFERENCE against a REAL pre-event scene. This is
+  what actually appeared or changed — the real signal of the event.
+
+RULE — when the user asks to detect an EVENT (a flood, a fire/burn, new construction, snow melt), the
+Executive Summary and the Conclusions MUST lead with the CHANGE evidence (INDEX_CHANGE + SAR_CHANGE),
+NEVER with the total INDEX_EXTENT. The total extent may only be mentioned later, as context, and MUST
+be labelled as "total … including pre-existing/permanent features (sea, lagoons, rivers, the existing
+city…)" — never present a total-extent percentage as the headline "% flooded / % burned / % changed".
+Example for a flood: headline "confirmed new water X% (SAR) / probable new water Y% (optical change)",
+NOT "N% of the area is water" using the total water extent.
+
+FORBIDDEN WORDING — the words "flood/flooded/inundación/inundada" (or "burned/quemada", "new
+construction/nueva construcción") must be attached ONLY to the CHANGE and SAR-confirmed figures,
+NEVER to an INDEX_EXTENT total. When you present an INDEX_EXTENT figure, title its section "Agua
+total detectada (incluye cuerpos permanentes)" — NOT "Extensión de la inundación" — and state
+explicitly that it counts permanent water (sea, lagoons, rivers, canals) that was already there and
+is therefore NOT a measure of how much area flooded. A total-extent percentage described as
+"% del área inundada" is a factual error and must not appear.
+
+## Reading the pixel percentages (both families)
+- If the CHANGE percentages are low (a few % or less) and the area-wide means are ambiguous, the
+  correct conclusion is that there is little to no evidence of the event — say so plainly.
+- If the CHANGE percentages are substantial (tens of %), report that as clear evidence.
+- If sources disagree (e.g. SAR shows change but the optical change doesn't, or vice versa), report
+  that disagreement transparently instead of silently picking the conclusion that seems more dramatic.
 - Any stat named "pct_area_valid" tells you what fraction of the AOI actually has usable data (the
   rest was cloud/shadow and is unknown, not "unaffected") — always mention this coverage limit.
-- Any stat suffixed "_excl_urban" excludes pixels with a built-up spectral signature, which is a
-  known source of false water/flood positives in NDWI/MNDWI — prefer it over the unfiltered version.
+- Any stat suffixed "_excl_urban" excludes pixels with a built-up spectral signature, a known source
+  of false water/flood positives in NDWI/MNDWI — ALWAYS prefer it over the unfiltered version.
+- Only discuss the phenomenon the user actually asked about. Do NOT report burn / snow / urban-growth
+  statistics in a flood or water report (or vice versa) unless the user explicitly asked for a
+  multi-hazard analysis — they are noise and undermine the report's credibility.
 
 ## CRITICAL RULE
 Never state a conclusion the numbers do not support. Base your conclusion strictly on the computed
@@ -191,6 +215,39 @@ def _build_evidence_table_md(computed_indices: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+# Subcadenas de claves relevantes por tipo de análisis. Sirve para no verter en
+# la prosa del LLM estadísticas de fenómenos ajenos (p. ej. quemaduras o nieve en
+# un informe de inundación), que solo añaden ruido. La tabla de evidencia final
+# (_build_evidence_table_md) sigue mostrando TODOS los valores por transparencia;
+# esto solo limpia el texto narrado y los bloques de evidencia inyectados.
+_RELEVANT_STAT_SUBSTRINGS = {
+    "water":      ("ndwi", "mndwi", "awei", "water"),
+    "flood":      ("ndwi", "mndwi", "awei", "water"),
+    "fire":       ("nbr", "bais2", "burn"),
+    "snow":       ("ndsi", "snow"),
+    "urban":      ("ndbi", "built_up", "urban"),
+    "vegetation": ("ndvi", "evi", "savi", "lai", "veg"),
+}
+# Claves que se conservan siempre: cobertura válida y el contexto de confusión
+# urbana (fuente conocida de falsos positivos de agua).
+_ALWAYS_KEEP_STATS = ("pct_area_valid", "pct_urban_like")
+
+
+def _filter_stats_by_analysis(stats: dict, analysis_type: str) -> dict:
+    """Conserva solo las estadísticas relevantes para el analysis_type dado.
+    Para tipos sin mapeo (soil/general) devuelve una copia sin filtrar."""
+    if not stats:
+        return {}
+    subs = _RELEVANT_STAT_SUBSTRINGS.get(analysis_type)
+    if not subs:
+        return dict(stats)
+    return {
+        key: value
+        for key, value in stats.items()
+        if key in _ALWAYS_KEEP_STATS or any(s in key for s in subs)
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Agent
 # ─────────────────────────────────────────────────────────────────────────────
@@ -215,13 +272,22 @@ class ReporterAgent:
         output_files    = state.get("output_files") or []
         code_iterations = state.get("code_iterations", 1)
 
+        # Copia de los índices para el LLM con INDEX_EXTENT/INDEX_CHANGE filtrados
+        # al fenómeno consultado (evita que se cuelen quemaduras/nieve en un
+        # informe de agua). Los índices principales (NDWI/MNDWI/AWEI/SAR) pasan
+        # intactos; la tabla de evidencia final sigue mostrando todo.
+        report_indices = dict(computed_indices)
+        for _k in ("INDEX_EXTENT", "INDEX_CHANGE"):
+            if isinstance(report_indices.get(_k), dict):
+                report_indices[_k] = _filter_stats_by_analysis(report_indices[_k], analysis_type)
+
         # ── Build report context for the LLM ──────────────────────────────
         context = {
             "user_query":    state["user_query"],
             "location":      location,
             "date_range":    date_range,
             "analysis_type": analysis_type,
-            "indices":       computed_indices,
+            "indices":       report_indices,
             "scene_info":    {
                 "id":           selected_scene.get("id", "N/A"),
                 "date":         selected_scene.get("date", "N/A"),
@@ -235,31 +301,24 @@ class ReporterAgent:
         # Evidencia por píxel — genérica, se aplica a CUALQUIER analysis_type,
         # no solo inundación (INDEX_EXTENT/INDEX_CHANGE se calculan siempre que
         # haya bandas ópticas legibles; SAR_CHANGE solo existe para inundación).
-        index_extent  = computed_indices.get("INDEX_EXTENT", {})
-        index_change  = computed_indices.get("INDEX_CHANGE", {})
+        # Filtradas al fenómeno consultado para no narrar índices ajenos.
+        index_extent  = _filter_stats_by_analysis(computed_indices.get("INDEX_EXTENT", {}), analysis_type)
+        index_change  = _filter_stats_by_analysis(computed_indices.get("INDEX_CHANGE", {}), analysis_type)
         sar_stats     = computed_indices.get("SAR_CHANGE", {})
         sar_available = state.get("sar_available") or False
 
         evidence_note = ""
-        if index_extent:
-            evidence_note += _format_evidence_block(
-                "Evidencia por píxel en la escena analizada (NO es una media de área — evita "
-                "que una señal localizada se diluya)",
-                index_extent,
-                note=(
-                    "Los stats '_excl_urban' descuentan confusión con zonas edificadas en "
-                    "NDWI/MNDWI (limitación conocida) — son más fiables que la versión sin filtrar."
-                ),
-            )
         if index_change:
             evidence_note += _format_evidence_block(
-                "Cambio real pre/post evento (comparación con una escena Sentinel-2 previa "
-                "real, NO un baseline asumido)",
+                "CAMBIO REAL pre/post evento (comparación con una escena Sentinel-2 previa real, "
+                "NO un baseline asumido). ESTA es la evidencia principal del evento: la cifra "
+                "titular del resumen y de las conclusiones debe salir de aquí y/o del SAR confirmado",
                 index_change,
             )
         if sar_available and sar_stats:
             evidence_note += (
-                "\n\nSentinel-1 SAR Change Detection (penetra nubes — detecta agua turbia):\n"
+                "\n\nSentinel-1 SAR Change Detection (penetra nubes — detecta agua turbia). "
+                "Junto con el cambio óptico, es la evidencia TITULAR del evento:\n"
                 f"  · Cambio medio de retrodispersión: {sar_stats.get('mean_change_dB', '?')} dB\n"
                 f"  · Área con posible inundación (Δ < -3 dB): {sar_stats.get('pct_possible_flood', '?')}%\n"
                 f"  · Área con inundación confirmada (Δ < -5 dB): {sar_stats.get('pct_confirmed_flood', '?')}%\n"
@@ -270,14 +329,27 @@ class ReporterAgent:
                 "\n\nNota: Datos Sentinel-1 SAR no disponibles para este evento. "
                 "La extensión de la inundación se basa en los índices ópticos disponibles."
             )
+        if index_extent:
+            evidence_note += _format_evidence_block(
+                "Extensión TOTAL en la escena (recuento de píxeles con esa firma). CONTEXTO "
+                "SECUNDARIO, NO la magnitud del evento: incluye lo permanente (mar, lagunas, ríos, "
+                "ciudad ya existente). NO la uses como cifra titular; si la mencionas, etiquétala "
+                "como 'total incluyendo cuerpos/estructuras permanentes'",
+                index_extent,
+                note=(
+                    "Los stats '_excl_urban' descuentan confusión con zonas edificadas en "
+                    "NDWI/MNDWI (limitación conocida) — usa esos, son más fiables que la versión sin filtrar."
+                ),
+            )
 
         if evidence_note:
             evidence_note = (
                 "\n\nEvidencia cuantitativa adicional (calculada directamente sobre los datos, "
-                "independiente del código generado por el LLM analista). Basa tu conclusión "
-                "principalmente en los porcentajes de píxeles de abajo, no solo en la media de "
-                "área de cada índice. Si la evidencia es débil, inexistente o contradictoria "
-                "entre fuentes, dilo explícitamente en vez de forzar una conclusión."
+                "independiente del código generado por el LLM analista). Para un evento (inundación, "
+                "incendio, construcción nueva), la cifra TITULAR del resumen y de las conclusiones "
+                "debe salir del CAMBIO pre/post y/o del SAR confirmado, NO de la extensión total. "
+                "Si la evidencia es débil, inexistente o contradictoria entre fuentes, dilo "
+                "explícitamente en vez de forzar una conclusión."
                 + evidence_note
             )
 

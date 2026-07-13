@@ -154,6 +154,14 @@ async def get_cesium_data(session_id: str) -> JSONResponse:
             "lat": (bbox[1] + bbox[3]) / 2,
         }
 
+    # Bounds reales del raster (WGS-84) calculados por el Analyst: el tile
+    # descargado cubre más que el bbox del plan, así que las capas deben
+    # proyectarse sobre estos bounds y no sobre el bbox.
+    overlays = state.get("map_overlays") or []
+    raster_bounds = next(
+        (ov.get("bounds") for ov in overlays if ov.get("bounds")), None
+    )
+
     # Capas: buscar PNGs de índices en outputs/
     _INDEX_COLORMAP = {
         "ndvi": "ndvi", "evi": "ndvi", "evi2": "ndvi",
@@ -170,7 +178,24 @@ async def get_cesium_data(session_id: str) -> JSONResponse:
                 "type": "imagery_url",
                 "url": f"/outputs/{idx}.png",
                 "colormap": cmap,
+                "bounds": raster_bounds,
             })
+
+    # Capas de zonas afectadas (agua/fuego/vegetación...) generadas por el
+    # Analyst como PNG RGBA transparentes, con su leyenda de colores.
+    for ov in overlays:
+        fname = ov.get("file")
+        if not fname or not (OUTPUTS_DIR / fname).exists():
+            continue
+        layers.append({
+            "id": f"overlay_{ov.get('id')}",
+            "name": ov.get("name") or ov.get("id"),
+            "type": "overlay",
+            "url": f"/outputs/{fname}",
+            "bounds": ov.get("bounds"),
+            "legend": ov.get("legend") or [],
+            "visible": ov.get("visible", True),
+        })
 
     # GeoJSON del área de estudio
     study_geojson = None
@@ -229,7 +254,7 @@ def _run_pipeline_sync(query: str, session_id: str) -> tuple[dict, list[dict]]:
         "selected_scene": None, "downloaded_files": None,
         "acquisition_error": None, "generated_code": None,
         "execution_result": None, "computed_indices": None,
-        "output_files": None, "code_iterations": 0,
+        "output_files": None, "map_overlays": None, "code_iterations": 0,
         "analysis_error": None, "report_markdown": None,
         "map_html": None, "chart_paths": None,
         "messages": [], "current_agent": "planner",

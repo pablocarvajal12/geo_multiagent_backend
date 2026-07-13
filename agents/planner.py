@@ -79,10 +79,14 @@ return a STRICT JSON execution plan — no extra text, only the JSON object.
 - Keep bbox TIGHT (≤ 0.5° × 0.5°) to target the specific flood zone, not a whole region.
 - General rule: for coastal flood queries, keep max_lon ≤ centroid_lon + 0.2°.
 
-## Event-based flood queries
-- If the query names a specific storm/flood event, use your own knowledge of that event's
-  real date to set date_range, preferring the post-event window (event_date to event_date + 7-10
-  days) over a whole month, so the imagery is close to the event itself.
+## Event-based queries (flood, fire, storm)
+- If the query names a specific event AND you are CERTAIN of its exact date, set
+  date_range from that date to 7-10 days after it.
+- If the query only names a month or a vague period (e.g. "octubre de 2024"), do NOT
+  guess a sub-range from your own knowledge (the event may be after your training data):
+  cover the WHOLE named period and add 10 extra days after its end, so post-event
+  imagery exists for change detection.
+  Example: "inundaciones de octubre de 2024" → {{"start": "2024-10-01", "end": "2024-11-10"}}.
 """
 
 

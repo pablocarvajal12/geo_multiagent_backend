@@ -86,6 +86,9 @@ def search_planetary_computer(
                         "collection": collection,
                         "date": item["properties"].get("datetime", ""),
                         "cloud_cover": item["properties"].get("eo:cloud_cover", -1),
+                        # % de píxeles clasificados como agua (clave para detectar
+                        # la escena de una inundación dentro de la ventana)
+                        "water_percentage": item["properties"].get("s2:water_percentage"),
                         "bbox": item.get("bbox", []),
                         "assets": {
                             k: v.get("href", "")
@@ -148,6 +151,7 @@ def search_earth_search(
                     "collection": item.get("collection", collections[0]),
                     "date": item["properties"].get("datetime", ""),
                     "cloud_cover": item["properties"].get("eo:cloud_cover", -1),
+                    "water_percentage": item["properties"].get("s2:water_percentage"),
                     "bbox": item.get("bbox", []),
                     "assets": {
                         k: v.get("href", "")
@@ -330,6 +334,61 @@ def _extract_mgrs_tile(scene_id: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _select_flood_scene_by_water_anomaly(scenes: list) -> Optional[dict]:
+    """
+    Escena de inundación por ANOMALÍA de clasificación de agua: dentro de cada
+    tile MGRS, mide cuánto se desvía el s2:water_percentage de cada escena
+    respecto a la MEDIANA de su tile en la ventana, en CUALQUIER dirección.
+
+    Validado con las escenas reales de la DANA de Valencia (oct-2024): en la
+    escena del evento el water%% se DESPLOMA (17.7%% frente a ~45%% normal del
+    tile), porque el clasificador SCL no reconoce como agua la riada turbia y
+    las nubes de la tormenta reducen los píxeles clasificados. Una inundación
+    de agua limpia lo sube. Por eso cuenta la desviación absoluta, no el signo,
+    y nunca el porcentaje absoluto (un tile costero siempre ronda el 50%% de mar).
+
+    Entre las escenas anómalas (a menos de 5 puntos de la desviación máxima) se
+    elige la MÁS TEMPRANA: es la más cercana al pico del evento.
+
+    Devuelve None si ningún tile tiene >= 3 escenas con metadato de agua o si la
+    desviación máxima no llega a 10 puntos (el llamante cae a 'earliest').
+    """
+    from collections import defaultdict
+    from statistics import median
+
+    by_tile: dict = defaultdict(list)
+    for s in scenes or []:
+        tile = _extract_mgrs_tile(s.get("id", ""))
+        wp = s.get("water_percentage")
+        if tile and isinstance(wp, (int, float)):
+            by_tile[tile].append(s)
+
+    MIN_DEVIATION_PCT_POINTS = 10.0
+    FINALIST_MARGIN = 5.0
+
+    candidates: list = []  # (desviación, escena)
+    for tile, tile_scenes in by_tile.items():
+        if len(tile_scenes) < 3:
+            continue  # con menos escenas la mediana no define un "normal" del tile
+        baseline = median(s["water_percentage"] for s in tile_scenes)
+        for s in tile_scenes:
+            deviation = abs(s["water_percentage"] - baseline)
+            if deviation >= MIN_DEVIATION_PCT_POINTS:
+                candidates.append((deviation, s))
+
+    if not candidates:
+        return None
+
+    top = max(dev for dev, _s in candidates)
+    finalists = [s for dev, s in candidates if dev >= top - FINALIST_MARGIN]
+    best = min(finalists, key=lambda s: s.get("date", ""))
+    logger.info(
+        "[DataAcquisition] Escena por anomalía de agua: %s (water%%=%.2f, desviación máx=%.1f pts, %d finalistas)",
+        best.get("id"), best.get("water_percentage", -1), top, len(finalists),
+    )
+    return best
+
+
 class DataAcquisitionAgent:
     """LangGraph node: find and download satellite imagery."""
 
@@ -379,15 +438,32 @@ class DataAcquisitionAgent:
             )
             cloud_max = 60
 
+        # Para inundaciones, ampliar la VENTANA DE BÚSQUEDA 15 días más allá del
+        # plan (sin tocar el plan): si el LLM eligió un subrango pre-evento
+        # (no puede conocer eventos posteriores a su entrenamiento), las escenas
+        # post-evento siguen entrando en la búsqueda y la selección por anomalía
+        # de agua puede encontrarlas.
+        search_end = end_date
+        search_limit = 10
+        if is_flood_query:
+            try:
+                end_dt_ = datetime.strptime(end_date, "%Y-%m-%d")
+                search_end = min(
+                    end_dt_ + timedelta(days=15), datetime.utcnow()
+                ).strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+            search_limit = 25  # más escenas por tile → mejor anomalía de agua
+
         # 1. Buscar en Planetary Computer
         logger.info("[DataAcquisition] Searching Planetary Computer...")
         results = search_planetary_computer.func(
             bbox=bbox,
             start_date=start_date,
-            end_date=end_date,
+            end_date=search_end,
             collections=collections,
             cloud_cover_max=cloud_max,
-            limit=10,
+            limit=search_limit,
         )
         scenes = results.get("items", [])
 
@@ -397,10 +473,10 @@ class DataAcquisitionAgent:
             results2 = search_earth_search.func(
                 bbox=bbox,
                 start_date=start_date,
-                end_date=end_date,
+                end_date=search_end,
                 collections=collections,
                 cloud_cover_max=cloud_max,
-                limit=10,
+                limit=search_limit,
             )
             scenes += results2.get("items", [])
 
@@ -417,10 +493,10 @@ class DataAcquisitionAgent:
                 retry_results = retry_fn(
                     bbox=bbox,
                     start_date=start_date,
-                    end_date=end_date,
+                    end_date=search_end,
                     collections=collections,
                     cloud_cover_max=80,
-                    limit=10,
+                    limit=search_limit,
                 )
                 scenes += retry_results.get("items", [])
                 if scenes:
@@ -440,18 +516,23 @@ class DataAcquisitionAgent:
             }
 
         # 3. Seleccionar mejor escena
-        # Para índices de agua/inundación preferir la escena MÁS TEMPRANA dentro de la
-        # ventana post-evento (más cercana a la tormenta): el agua superficial suele
-        # drenar en pocos días, así que "most_recent" corría el riesgo de capturar la
-        # escena menos representativa de la inundación real.
-        WATER_INDICES = {"NDWI", "MNDWI", "AWEI", "NDWI2", "WRI", "NDSI"}
-        is_flood_query = bool(WATER_INDICES.intersection({i.upper() for i in indices}))
-        scene_preference = "earliest" if is_flood_query else "lowest_cloud"
-        selected = select_best_scene.func(scenes=scenes, preference=scene_preference)
+        # Para inundaciones: primero intentar la escena con mayor ANOMALÍA de
+        # porcentaje de agua dentro de su tile (detecta la escena del evento sin
+        # depender de que el LLM conozca la fecha exacta). Si no hay metadatos
+        # suficientes, caer a la MÁS TEMPRANA de la ventana (cercana a la
+        # tormenta; el agua superficial drena en pocos días).
+        selected = None
+        scene_preference = "lowest_cloud"
+        if is_flood_query:
+            selected = _select_flood_scene_by_water_anomaly(scenes)
+            scene_preference = "water_anomaly" if selected else "earliest"
+        if selected is None:
+            selected = select_best_scene.func(scenes=scenes, preference=scene_preference)
         logger.info(
-            "[DataAcquisition] Selected scene: %s  preference=%s  cloud=%.1f%%  date=%s",
+            "[DataAcquisition] Selected scene: %s  preference=%s  cloud=%.1f%%  date=%s  water%%=%s",
             selected.get("id"), scene_preference,
             selected.get("cloud_cover", -1), selected.get("date", ""),
+            selected.get("water_percentage"),
         )
 
         # 4. Determinar bandas necesarias para los índices
@@ -486,12 +567,23 @@ class DataAcquisitionAgent:
         sar_note: str = "no solicitado"
         pre_optical_files: list[str] = []
 
+        # La fecha "evento" de referencia es la de la ESCENA seleccionada (que la
+        # selección por anomalía de agua sitúa justo tras la inundación), no el
+        # inicio del plan: si el LLM eligió un subrango equivocado, anclar el SAR
+        # y el pre-óptico al plan compararía dos fechas sin evento entre medias.
+        scene_date_str = (selected.get("date") or start_date)[:10]
+
         if state.get("analysis_type") == "flood":
             logger.info("[DataAcquisition] Flood query — iniciando adquisición Sentinel-1 SAR")
+            try:
+                scene_dt = datetime.strptime(scene_date_str, "%Y-%m-%d")
+                sar_post_end = min(scene_dt + timedelta(days=7), datetime.utcnow()).strftime("%Y-%m-%d")
+            except ValueError:
+                sar_post_end = end_date
             sar_result = _acquire_sentinel1_sar(
                 bbox=bbox,
-                event_date_str=start_date,
-                post_end_str=end_date,
+                event_date_str=scene_date_str,
+                post_end_str=sar_post_end,
             )
             pre_scene_files = sar_result["pre_files"]
             sar_available   = sar_result["sar_available"]
@@ -509,21 +601,37 @@ class DataAcquisitionAgent:
             except ValueError:
                 start_dt = end_dt = None
 
+            pre_target_dt = None  # objetivo estacional para elegir la escena pre (solo interanual)
             if start_dt is None:
                 pre_start = pre_end = None
             elif state.get("analysis_type") == "flood":
-                # Evento puntual conocido: comparar contra una escena despejada de
-                # las semanas justo antes de la tormenta.
-                pre_start = (start_dt - timedelta(days=35)).strftime("%Y-%m-%d")
-                pre_end   = (start_dt - timedelta(days=10)).strftime("%Y-%m-%d")
+                # Comparar contra una escena despejada de las semanas justo antes
+                # del evento, anclado a la fecha de la ESCENA seleccionada (la
+                # selección por anomalía la sitúa justo tras la inundación).
+                try:
+                    anchor_dt = datetime.strptime(scene_date_str, "%Y-%m-%d")
+                except ValueError:
+                    anchor_dt = start_dt
+                pre_start = (anchor_dt - timedelta(days=40)).strftime("%Y-%m-%d")
+                pre_end   = (anchor_dt - timedelta(days=8)).strftime("%Y-%m-%d")
             else:
-                # Sin evento puntual: comparar contra el MISMO periodo del año
-                # anterior (con margen de ±15 días) para controlar la estacionalidad.
-                # Comparar verano-2024 contra primavera-2024 (unas semanas antes)
-                # confundiría el ciclo normal de secado estival con una pérdida real
-                # de vegetación — el mismo problema que dNBR tiene con el otoño.
-                pre_start = (start_dt - timedelta(days=365 + 15)).strftime("%Y-%m-%d")
-                pre_end   = (end_dt   - timedelta(days=365 - 15)).strftime("%Y-%m-%d")
+                # Sin evento puntual (vegetación, urbano, deshielo, cicatriz…):
+                # comparar contra el MISMO momento del año anterior para controlar
+                # la estacionalidad. Se ancla a la fecha de la ESCENA post (no al
+                # rango de la consulta) con margen estrecho (±30 días), y luego la
+                # escena pre se elige por PROXIMIDAD estacional (ver target_date),
+                # no solo por nubosidad. Sin este anclaje, una ventana ancha (toda
+                # la temporada anterior) elegía la más despejada aunque cayera en
+                # otra fase fenológica — p.ej. octubre-2023 ya reverdecido tras las
+                # lluvias frente a un septiembre-2024 seco — recreando el artefacto
+                # estacional que precisamente se quería eliminar.
+                try:
+                    anchor_dt = datetime.strptime(scene_date_str, "%Y-%m-%d")
+                except (ValueError, TypeError):
+                    anchor_dt = end_dt
+                pre_target_dt = anchor_dt - timedelta(days=365)
+                pre_start = (pre_target_dt - timedelta(days=30)).strftime("%Y-%m-%d")
+                pre_end   = (pre_target_dt + timedelta(days=30)).strftime("%Y-%m-%d")
 
             if pre_start and pre_end:
                 pre_bands_needed = bands_needed & {"B02", "B03", "B04", "B08", "B11", "B12"}
@@ -535,6 +643,7 @@ class DataAcquisitionAgent:
                 pre_optical_result = _acquire_pre_event_optical(
                     bbox=bbox, pre_start=pre_start, pre_end=pre_end, bands=list(pre_bands_needed),
                     preferred_tile=_extract_mgrs_tile(selected.get("id", "")),
+                    target_date=pre_target_dt,
                 )
                 pre_optical_files = pre_optical_result["pre_optical_files"]
                 if pre_optical_result["pre_optical_available"]:
@@ -648,13 +757,15 @@ def _acquire_sentinel1_sar(
         return result
     result["pre_files"].append(pre_path)
 
-    # Post-evento
+    # Post-evento: la MÁS TEMPRANA de la ventana (la búsqueda ordena descendente,
+    # así que es el último elemento). Es la más cercana al pico de la inundación;
+    # la más tardía captaría el agua ya drenada.
     post_scenes = _search_s1(event_date_str, post_end_str)
     if not post_scenes:
         result["note"] = f"Sin escenas S1 post-evento ({event_date_str}→{post_end_str})"
         logger.warning("[SAR] %s", result["note"])
         return result
-    post_path = _download_vv(post_scenes[0], "post")
+    post_path = _download_vv(post_scenes[-1], "post")
     if not post_path:
         result["note"] = "Descarga VV post-evento fallida"
         return result
@@ -679,16 +790,23 @@ def _acquire_pre_event_optical(
     pre_end: str,
     bands: list[str],
     preferred_tile: Optional[str] = None,
+    target_date: Optional[datetime] = None,
 ) -> dict:
     """
     Busca y descarga las bandas indicadas (las que necesiten los índices
-    solicitados, más SCL) de la escena Sentinel-2 más despejada dentro de la
-    ventana [pre_start, pre_end], para poder calcular un cambio real pre/post
-    en vez de comparar la media del área contra un baseline asumido.
+    solicitados, más SCL) de la escena Sentinel-2 dentro de la ventana
+    [pre_start, pre_end], para poder calcular un cambio real pre/post en vez de
+    comparar la media del área contra un baseline asumido.
 
-    La elección de esa ventana (corta antes de un evento puntual, o el mismo
-    periodo del año anterior para controlar estacionalidad) se decide en el
-    llamador, que es quien conoce el analysis_type — ver __call__.
+    La elección de esa ventana (corta antes de un evento puntual, o alrededor
+    del mismo momento del año anterior para controlar estacionalidad) se decide
+    en el llamador, que es quien conoce el analysis_type — ver __call__.
+
+    Si se indica target_date, la escena se elige por PROXIMIDAD de calendario a
+    esa fecha (misma fase fenológica que la post, usando la nubosidad solo como
+    desempate) en vez de por menor nubosidad a secas. Esto evita que, en una
+    comparación interanual, se elija una escena de otra fase estacional solo por
+    estar más despejada. Sin target_date se mantiene el criterio de menor nube.
 
     Si se indica preferred_tile, se EXIGE que la escena pre-evento pertenezca
     al mismo tile MGRS que la escena post-evento. Regiones grandes (p.ej.
@@ -702,13 +820,17 @@ def _acquire_pre_event_optical(
     """
     result: dict = {"pre_optical_files": [], "pre_optical_available": False, "note": ""}
 
+    # limit alto: la búsqueda pagina por fecha, y con un límite bajo una ventana
+    # amplia sobre varios tiles solo devuelve las fechas más tardías — dejaría
+    # fuera la escena estacionalmente más cercana (la que luego elige target_date)
+    # y forzaría a coger una de otra fase (p.ej. el rebrote de finales de mes).
     search = search_planetary_computer.func(
         bbox=bbox,
         start_date=pre_start,
         end_date=pre_end,
         collections=["sentinel-2-l2a"],
         cloud_cover_max=20,
-        limit=10,
+        limit=200,
     )
     scenes = search.get("items", [])
     if not scenes:
@@ -727,7 +849,27 @@ def _acquire_pre_event_optical(
             return result
         scenes = same_tile
 
-    best = select_best_scene.func(scenes=scenes, preference="lowest_cloud")
+    if target_date is not None:
+        # Elegir la escena pre más cercana en el calendario a target_date (misma
+        # fase fenológica que la post); la nubosidad solo desempata. Así una
+        # comparación interanual no acaba mezclando estaciones (ver docstring).
+        def _season_gap(s: dict):
+            d = (s.get("date", "") or "")[:10]
+            try:
+                gap = abs((datetime.strptime(d, "%Y-%m-%d") - target_date).days)
+            except ValueError:
+                gap = 10 ** 6
+            return (gap, s.get("cloud_cover", 100))
+
+        best = sorted(scenes, key=_season_gap)[0]
+        logger.info(
+            "[PreOptical] Escena pre por proximidad estacional: %s (objetivo %s, cloud=%.1f%%)",
+            (best.get("date", "") or "")[:10],
+            target_date.strftime("%Y-%m-%d"),
+            best.get("cloud_cover", -1),
+        )
+    else:
+        best = select_best_scene.func(scenes=scenes, preference="lowest_cloud")
     downloaded = download_scene_bands.func(scene=best, bands=bands)
     files = [v for v in downloaded.values() if not v.startswith("ERROR")]
 

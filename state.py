@@ -51,6 +51,8 @@ class GeoAgentState(TypedDict):
     execution_result: Optional[dict]          # stdout, stderr y excepción capturada
     computed_indices: Optional[dict]          # {"NDVI": {"mean": ..., "std": ...}}
     output_files: Optional[list[str]]         # Rutas de PNG y GeoTIFF generados
+    map_overlays: Optional[list[dict]]        # Capas RGBA de zonas afectadas para CesiumJS
+                                              # [{id, name, file, bounds, legend}, ...]
     code_iterations: int                      # Iteraciones de depuración usadas
     analysis_error: Optional[str]
 

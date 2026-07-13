@@ -65,6 +65,8 @@ numpy, rasterio, matplotlib, PIL (Pillow), scipy, pandas, pathlib, json, os
          arr = src.read(1, out_shape=(h, w), resampling=Resampling.average).astype(np.float32)
      arr[arr <= 0] = np.nan
      arr = arr / 10000.0
+     if np.nanmin(arr) > 0.04:  # BOA offset (processing baseline >= 04.00, scenes from 2022+)
+         arr = np.clip(arr - 0.1, 0.0001, None)
      ```
    - IMPORTANT: `src.read(1, out_shape=(h, w))` uses a 2D out_shape when reading a single band by scalar index. Never use (1, h, w) with a scalar band index.
    - All file reading MUST happen INSIDE the `with rasterio.open(...) as src:` block.
@@ -336,29 +338,11 @@ def _python_fallback_compute(
         return {}, []
 
     TARGET = 512
-    BAND_MAP = {"B02": "BLUE", "B03": "GREEN", "B04": "RED",
-                "B08": "NIR",  "B11": "SWIR1", "B12": "SWIR2"}
 
-    # ── Leer bandas desde TIF ─────────────────────────────────────────────
-    bands: dict = {}
-    for path in (downloaded_files or []):
-        for suffix, band_name in BAND_MAP.items():
-            if path.endswith(f"_{suffix}.tif") and band_name not in bands:
-                try:
-                    with rasterio.open(path) as src:
-                        h = min(TARGET, src.height)
-                        w = min(TARGET, src.width)
-                        arr = src.read(
-                            1,
-                            out_shape=(h, w),
-                            resampling=Resampling.average,
-                        ).astype(np.float32)
-                    arr[arr <= 0] = np.nan
-                    arr /= 10000.0
-                    bands[band_name] = arr
-                    logger.info("[Fallback] Banda %s leída: shape=%s", band_name, arr.shape)
-                except Exception as exc:
-                    logger.warning("[Fallback] No se pudo leer %s: %s", path, exc)
+    # ── Leer bandas desde TIF (lectura compartida, con corrección de offset BOA) ──
+    bands: dict = _read_optical_bands(downloaded_files, target=TARGET)
+    if bands:
+        logger.info("[Fallback] Bandas leídas: %s", sorted(bands.keys()))
 
     is_synthetic = len(bands) == 0
 
@@ -447,15 +431,22 @@ def _sar_flood_analysis(
     pre_files: list,
     post_files: list,
     outputs_dir: Path,
-) -> tuple[dict, list]:
+    bbox: Optional[list] = None,
+) -> tuple[dict, list, list]:
     """
     Detección de inundaciones por cambio de retrodispersión SAR (Sentinel-1 GRD VV).
 
     Método:
-      1. Lee bandas VV pre y post evento (float32 en unidades de potencia lineal)
+      1. Reproyecta las bandas VV pre y post a una malla común EPSG:4326
+         (los GRD vienen en geometría radar con GCPs, sin CRS: leerlos "tal
+         cual" compara píxeles de sitios distintos si las órbitas difieren)
       2. Convierte a dB: σ° = 10 * log10(valor + ε)
       3. Imagen de cambio: Δσ° = post_dB - pre_dB
       4. Máscara: Δ < -3 dB = posible inundación, Δ < -5 dB = inundación confirmada
+
+    Si se pasa `bbox` (área de estudio del plan), el análisis se recorta a esa
+    zona (con margen), lo que además hace que los porcentajes se refieran al
+    área de interés y no a toda la escena SAR (~250 km de swath).
 
     El SAR penetra nubes — detecta agua durante la tormenta misma.
     El agua tranquila refleja la señal lejos del sensor → muy baja retrodispersión.
@@ -464,24 +455,39 @@ def _sar_flood_analysis(
         import numpy as np
         import rasterio
         from rasterio.enums import Resampling
+        from rasterio.vrt import WarpedVRT
         from PIL import Image
         import matplotlib
     except ImportError as exc:
         logger.warning("[SAR] Dependencia no disponible: %s", exc)
-        return {}, []
+        return {}, [], []
 
     if not pre_files or not post_files:
         logger.warning("[SAR] pre_files o post_files vacíos — saltando análisis SAR")
-        return {}, []
+        return {}, [], []
 
     TARGET = 512
 
-    def _read_vv(path: str) -> Optional["np.ndarray"]:
+    def _open_warped(src):
+        src_crs = src.crs
+        if src_crs is None and src.gcps and src.gcps[1] is not None:
+            src_crs = src.gcps[1]
+        return WarpedVRT(src, src_crs=src_crs, crs="EPSG:4326",
+                         resampling=Resampling.average)
+
+    def _warped_extent(path: str) -> Optional[tuple]:
         try:
-            with rasterio.open(path) as src:
-                h = min(TARGET, src.height)
-                w = min(TARGET, src.width)
-                arr = src.read(1, out_shape=(h, w),
+            with rasterio.open(path) as src, _open_warped(src) as vrt:
+                return tuple(vrt.bounds)
+        except Exception as exc:
+            logger.warning("[SAR] No se pudo georreferenciar %s: %s", path, exc)
+            return None
+
+    def _read_vv_window(path: str, bounds: tuple) -> Optional["np.ndarray"]:
+        try:
+            with rasterio.open(path) as src, _open_warped(src) as vrt:
+                window = vrt.window(*bounds)
+                arr = vrt.read(1, window=window, out_shape=(TARGET, TARGET),
                                resampling=Resampling.average).astype(np.float32)
             arr[arr <= 0] = np.nan
             return arr
@@ -489,17 +495,32 @@ def _sar_flood_analysis(
             logger.warning("[SAR] No se pudo leer %s: %s", path, exc)
             return None
 
-    pre_vv  = _read_vv(pre_files[0])
-    post_vv = _read_vv(post_files[0])
+    # Malla común: intersección de ambas escenas (y del bbox del plan con margen)
+    pre_extent  = _warped_extent(pre_files[0])
+    post_extent = _warped_extent(post_files[0])
+    if pre_extent is None or post_extent is None:
+        logger.warning("[SAR] Falta georreferenciación pre o post")
+        return {}, [], []
+
+    common = [max(pre_extent[0], post_extent[0]), max(pre_extent[1], post_extent[1]),
+              min(pre_extent[2], post_extent[2]), min(pre_extent[3], post_extent[3])]
+    if bbox and len(bbox) == 4:
+        margin = 0.3  # grados de contexto alrededor del área de estudio
+        focused = [max(common[0], bbox[0] - margin), max(common[1], bbox[1] - margin),
+                   min(common[2], bbox[2] + margin), min(common[3], bbox[3] + margin)]
+        if focused[0] < focused[2] and focused[1] < focused[3]:
+            common = focused
+    if not (common[0] < common[2] and common[1] < common[3]):
+        logger.warning("[SAR] Las escenas pre y post no se solapan — se omite")
+        return {}, [], []
+    common_bounds = tuple(common)
+
+    pre_vv  = _read_vv_window(pre_files[0], common_bounds)
+    post_vv = _read_vv_window(post_files[0], common_bounds)
 
     if pre_vv is None or post_vv is None:
         logger.warning("[SAR] Falta pre o post VV")
-        return {}, []
-
-    # Alinear dimensiones
-    h = min(pre_vv.shape[0], post_vv.shape[0])
-    w = min(pre_vv.shape[1], post_vv.shape[1])
-    pre_vv, post_vv = pre_vv[:h, :w], post_vv[:h, :w]
+        return {}, [], []
 
     # Conversión a dB
     eps = 1e-10
@@ -549,6 +570,29 @@ def _sar_flood_analysis(
     except Exception:
         pass
 
+    # Overlay transparente para el globo 3D: solo los píxeles inundados llevan color
+    overlays: list = []
+    if bool(np.any(possible_flood)):
+        overlay_path = outputs_dir / "overlay_sar_flood.png"
+        try:
+            _save_overlay_png(change_db.shape, [
+                (possible_flood & ~confirmed_flood, [255, 180, 40, 140]),
+                (confirmed_flood,                   [0, 100, 200, 200]),
+            ], overlay_path)
+            overlays.append({
+                "id": "sar_flood",
+                "name": "Inundación (radar SAR)",
+                "file": "overlay_sar_flood.png",
+                "bounds": list(common_bounds),
+                "legend": [
+                    {"color": "#ffb428", "label": "Posible inundación (Δ < −3 dB)"},
+                    {"color": "#0064c8", "label": "Inundación confirmada (Δ < −5 dB)"},
+                ],
+            })
+            logger.info("[Overlay] overlay_sar_flood.png guardado")
+        except Exception as exc:
+            logger.warning("[Overlay] No se pudo guardar overlay_sar_flood.png: %s", exc)
+
     valid_change = change_db[~nan_mask]
     stats = {
         "mean_change_dB":      round(float(np.mean(valid_change)),  3),
@@ -563,7 +607,7 @@ def _sar_flood_analysis(
 
     logger.info("[SAR] Análisis completado — posible %.1f%%, confirmado %.1f%%",
                 pct_possible, pct_confirmed)
-    return {"SAR_CHANGE": stats}, output_files
+    return {"SAR_CHANGE": stats}, output_files, overlays
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -629,6 +673,19 @@ def _read_optical_bands(files: list, target: int = 512) -> dict:
                     bands[band_name] = arr
                 except Exception as exc:
                     logger.warning("No se pudo leer %s: %s", path, exc)
+
+    # Corrección del offset radiométrico BOA (baseline >= 04.00, ene-2022):
+    # la reflectancia real es (DN - 1000) / 10000, no DN / 10000. Sin la resta,
+    # el agua queda en ~0.10 en todas las bandas y los umbrales absolutos de los
+    # índices dejan de cumplirse. Detección por datos: en un tile completo
+    # siempre hay píxeles oscuros (agua/sombras) con reflectancia ≈ 0, así que
+    # un mínimo global > 0.04 delata el offset.
+    if bands:
+        global_min = min(float(np.nanmin(a)) for a in bands.values())
+        if global_min > 0.04:
+            for name in bands:
+                bands[name] = np.clip(bands[name] - 0.1, 0.0001, None)
+            logger.info("[Bands] Offset BOA -1000 detectado (min=%.4f) y corregido", global_min)
     return bands
 
 
@@ -673,6 +730,9 @@ INDEX_LEVEL_THRESHOLDS: dict = {
     "NDVI":  [("vegetated", ">", 0.2)],
     "NDBI":  [("built_up", ">", 0.2)],
     "NDSI":  [("snow", ">", 0.4)],
+    # NBR bajo en una sola escena es solo indicativo (el agua también lo da);
+    # el overlay de fuego excluye píxeles de agua vía NDWI cuando está disponible.
+    "NBR":   [("possible_burn", "<", 0.0), ("burn_scar", "<", -0.15)],
 }
 
 # Umbrales de CAMBIO real pre/post evento. El signo importa: agua/urbano nuevo
@@ -695,6 +755,147 @@ def _apply_threshold(array: "np.ndarray", op: str, value: float):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Overlays RGBA para el visor 3D (CesiumJS)
+#  Solo los píxeles afectados llevan color; el resto queda transparente, de
+#  modo que la capa puede proyectarse sobre el globo sin tapar el mapa base.
+#  Cada overlay lleva los bounds REALES del raster en WGS-84 — el tile
+#  descargado cubre mucho más que el bbox del plan, y proyectarlo sobre el
+#  bbox desplazaría las zonas marcadas de su posición verdadera.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _raster_bounds_4326(files: list) -> Optional[list]:
+    """Devuelve [W, S, E, N] en WGS-84 del primer GeoTIFF legible de la lista."""
+    try:
+        import rasterio
+        from rasterio.warp import transform_bounds
+    except ImportError:
+        return None
+    for path in files or []:
+        if not str(path).endswith(".tif"):
+            continue
+        try:
+            with rasterio.open(path) as src:
+                if src.crs is None:
+                    continue
+                w, s, e, n = transform_bounds(src.crs, "EPSG:4326", *src.bounds)
+            return [round(w, 6), round(s, 6), round(e, 6), round(n, 6)]
+        except Exception as exc:
+            logger.warning("[Overlay] No se pudieron leer bounds de %s: %s", path, exc)
+    return None
+
+
+def _save_overlay_png(shape: tuple, classes: list, path: Path) -> None:
+    """Guarda un PNG RGBA transparente. `classes` es [(máscara_bool, [r,g,b,a]), ...];
+    se pintan en orden, de modo que la última clase queda encima."""
+    import numpy as np
+    from PIL import Image
+
+    rgba = np.zeros((*shape, 4), dtype=np.uint8)
+    for mask, color in classes:
+        rgba[mask] = color
+    Image.fromarray(rgba, "RGBA").save(str(path))
+
+
+def _build_extent_overlays(
+    analysis_type: Optional[str],
+    arrays: dict,
+    valid: "np.ndarray",
+    outputs_dir: Path,
+    bounds: Optional[list],
+) -> list:
+    """
+    Genera los overlays de zonas afectadas relevantes para el tipo de análisis
+    (agua→azul, fuego→rojo, vegetación→verde, urbano→morado, nieve→cian) y
+    devuelve sus metadatos: [{id, name, file, bounds, legend}, ...].
+    """
+    import numpy as np
+
+    atype = (analysis_type or "general").lower()
+
+    # Firma de agua por SIGNO (NDWI>0: verde>NIR; MNDWI>0: verde>SWIR1), el
+    # criterio estándar de la literatura. Los signos de las diferencias no
+    # dependen del offset radiométrico, a diferencia de umbrales como 0.15.
+    water_like = None
+    if "NDWI" in arrays:
+        water_like = valid & (arrays["NDWI"] > 0.0)
+        if "MNDWI" in arrays:
+            water_like = water_like & (arrays["MNDWI"] > 0.0)
+
+    # (id, nombre de capa, [(máscara, rgba, color_css, etiqueta_leyenda), ...])
+    specs: list = []
+
+    if "NDWI" in arrays and atype in ("flood", "water", "general"):
+        ndwi = arrays["NDWI"]
+        if "MNDWI" in arrays:
+            # Con SWIR disponible, MNDWI manda: NDWI solo da mucho falso
+            # positivo en urbano/suelo desnudo/bruma.
+            mndwi = arrays["MNDWI"]
+            confirmed = valid & (mndwi > 0.0) & (ndwi > 0.0)
+            probable  = valid & ((mndwi > 0.0) | (ndwi > 0.15)) & ~confirmed
+        else:
+            confirmed = valid & (ndwi > 0.15)
+            probable  = valid & (ndwi > 0.05) & ~confirmed
+        specs.append(("water", "Zonas de agua", [
+            (probable,  [80, 180, 255, 110], "#50b4ff", "Agua probable"),
+            (confirmed, [0, 100, 200, 190],  "#0064c8", "Agua confirmada"),
+        ]))
+
+    if "NBR" in arrays and atype == "fire":
+        burned = valid & (arrays["NBR"] < 0.0)
+        if water_like is not None:
+            burned = burned & ~water_like  # el agua también da NBR bajo
+        severe = burned & (arrays["NBR"] < -0.15)
+        specs.append(("burn", "Zonas quemadas", [
+            (burned & ~severe, [255, 140, 0, 140], "#ff8c00", "Posible zona quemada"),
+            (severe,           [200, 30, 30, 200], "#c81e1e", "Zona quemada (severa)"),
+        ]))
+
+    if "NDVI" in arrays and atype in ("vegetation", "soil", "general"):
+        dense    = valid & (arrays["NDVI"] > 0.5)
+        moderate = valid & (arrays["NDVI"] > 0.2) & ~dense
+        specs.append(("vegetation", "Vegetación", [
+            (moderate, [150, 210, 130, 100], "#96d282", "Vegetación moderada"),
+            (dense,    [20, 140, 60, 160],   "#148c3c", "Vegetación densa"),
+        ]))
+
+    if "NDBI" in arrays and atype == "urban":
+        built = valid & (arrays["NDBI"] > 0.2)
+        specs.append(("urban", "Superficie edificada", [
+            (built, [155, 80, 210, 160], "#9b50d2", "Zona edificada"),
+        ]))
+
+    if "NDSI" in arrays and atype == "snow":
+        snow = valid & (arrays["NDSI"] > 0.4)
+        if water_like is not None:
+            snow = snow & ~water_like  # NDSI y agua turbia se confunden
+        specs.append(("snow", "Nieve / hielo", [
+            (snow, [130, 220, 255, 180], "#82dcff", "Nieve o hielo"),
+        ]))
+
+    shape = next(iter(arrays.values())).shape
+    overlays: list = []
+    for overlay_id, name, classes in specs:
+        if not any(bool(np.any(mask)) for mask, _rgba, _c, _l in classes):
+            continue  # nada que marcar — no se genera capa vacía
+        filename = f"overlay_{overlay_id}.png"
+        try:
+            _save_overlay_png(shape, [(m, rgba) for m, rgba, _c, _l in classes],
+                              outputs_dir / filename)
+        except Exception as exc:
+            logger.warning("[Overlay] No se pudo guardar %s: %s", filename, exc)
+            continue
+        overlays.append({
+            "id": overlay_id,
+            "name": name,
+            "file": filename,
+            "bounds": bounds,
+            "legend": [{"color": css, "label": label} for _m, _rgba, css, label in classes],
+        })
+        logger.info("[Overlay] %s guardado (%s)", filename, name)
+    return overlays
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Extensión por píxel — evidencia independiente del código del LLM
 #  Vale para cualquier tipo de análisis (agua, vegetación, urbano, fuego, nieve),
 #  no solo inundaciones: evita que una señal localizada se diluya en la media
@@ -704,19 +905,20 @@ def _apply_threshold(array: "np.ndarray", op: str, value: float):
 def _index_extent_analysis(
     downloaded_files: list,
     outputs_dir: Path,
-) -> tuple[dict, list]:
+    analysis_type: Optional[str] = None,
+) -> tuple[dict, list, list]:
     try:
         import numpy as np
         from PIL import Image
         import matplotlib
     except ImportError as exc:
         logger.warning("[IndexExtent] Dependencia no disponible: %s", exc)
-        return {}, []
+        return {}, [], []
 
     bands = _read_optical_bands(downloaded_files)
     if not bands:
         logger.warning("[IndexExtent] Sin bandas ópticas legibles — se omite")
-        return {}, []
+        return {}, [], []
 
     total_scene_pixels = int(next(iter(bands.values())).size)
 
@@ -729,7 +931,7 @@ def _index_extent_analysis(
     if not arrays:
         logger.warning("[IndexExtent] Ningún índice calculable con las bandas disponibles (%s)",
                         list(bands.keys()))
-        return {}, []
+        return {}, [], []
 
     valid = np.ones(next(iter(arrays.values())).shape, dtype=bool)
     for arr in arrays.values():
@@ -787,8 +989,17 @@ def _index_extent_analysis(
         except Exception as exc:
             logger.warning("[IndexExtent] No se pudo guardar water_extent_mask.png: %s", exc)
 
-    logger.info("[IndexExtent] índices=%s stats=%s", list(arrays.keys()), stats)
-    return {"INDEX_EXTENT": stats}, output_files
+    # Overlays transparentes para el globo 3D, con bounds reales del raster
+    optical_files = [f for f in (downloaded_files or [])
+                     if any(str(f).endswith(f"_{s}.tif") for s in _INDEX_BAND_SUFFIXES)]
+    overlays = _build_extent_overlays(
+        analysis_type, arrays, valid, outputs_dir,
+        bounds=_raster_bounds_4326(optical_files),
+    )
+
+    logger.info("[IndexExtent] índices=%s stats=%s overlays=%s",
+                list(arrays.keys()), stats, [o["id"] for o in overlays])
+    return {"INDEX_EXTENT": stats}, output_files, overlays
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -802,38 +1013,48 @@ def _index_change_analysis(
     pre_files: list,
     post_files: list,
     outputs_dir: Path,
-) -> tuple[dict, list]:
+) -> tuple[dict, list, list]:
     try:
         import numpy as np
         from PIL import Image
         import matplotlib
     except ImportError as exc:
         logger.warning("[IndexChange] Dependencia no disponible: %s", exc)
-        return {}, []
+        return {}, [], []
 
     pre_bands  = _read_optical_bands(pre_files)
     post_bands = _read_optical_bands(post_files)
     if not pre_bands or not post_bands:
         logger.warning("[IndexChange] Bandas pre y/o post no disponibles — se omite")
-        return {}, []
+        return {}, [], []
 
+    # Se conservan también los arrays pre/post (no solo la diferencia) para
+    # poder clasificar "agua nueva": firma de agua en post que no estaba en pre.
+    # MNDWI se calcula aunque no tenga umbral de cambio, porque refuerza la firma.
+    pre_idx: dict = {}
+    post_idx: dict = {}
     changes: dict = {}
-    for idx_name in _CHANGE_CANDIDATE_INDICES:
+    for idx_name in (*_CHANGE_CANDIDATE_INDICES, "MNDWI"):
         pre_arr  = _compute_index_array(idx_name, pre_bands)
         post_arr = _compute_index_array(idx_name, post_bands)
         if pre_arr is None or post_arr is None:
             continue
         h = min(pre_arr.shape[0], post_arr.shape[0])
         w = min(pre_arr.shape[1], post_arr.shape[1])
-        changes[idx_name] = post_arr[:h, :w] - pre_arr[:h, :w]
+        pre_idx[idx_name]  = pre_arr[:h, :w]
+        post_idx[idx_name] = post_arr[:h, :w]
+        if idx_name in _CHANGE_CANDIDATE_INDICES:
+            changes[idx_name] = post_arr[:h, :w] - pre_arr[:h, :w]
 
     if not changes:
         logger.warning("[IndexChange] Ningún índice de cambio calculable con las bandas disponibles")
-        return {}, []
+        return {}, [], []
 
-    h = min(arr.shape[0] for arr in changes.values())
-    w = min(arr.shape[1] for arr in changes.values())
-    changes = {k: v[:h, :w] for k, v in changes.items()}
+    h = min(arr.shape[0] for arr in pre_idx.values())
+    w = min(arr.shape[1] for arr in pre_idx.values())
+    changes  = {k: v[:h, :w] for k, v in changes.items()}
+    pre_idx  = {k: v[:h, :w] for k, v in pre_idx.items()}
+    post_idx = {k: v[:h, :w] for k, v in post_idx.items()}
     total_scene_pixels = h * w
 
     valid = np.ones((h, w), dtype=bool)
@@ -851,7 +1072,9 @@ def _index_change_analysis(
             hh = min(valid.shape[0], pre_mask.shape[0], post_mask.shape[0])
             ww = min(valid.shape[1], pre_mask.shape[1], post_mask.shape[1])
             valid = valid[:hh, :ww] & pre_mask[:hh, :ww] & post_mask[:hh, :ww]
-            changes = {k: v[:hh, :ww] for k, v in changes.items()}
+            changes  = {k: v[:hh, :ww] for k, v in changes.items()}
+            pre_idx  = {k: v[:hh, :ww] for k, v in pre_idx.items()}
+            post_idx = {k: v[:hh, :ww] for k, v in post_idx.items()}
     else:
         logger.warning("[IndexChange] Banda SCL no disponible en pre y/o post — no se filtran nubes/sombras")
 
@@ -877,8 +1100,45 @@ def _index_change_analysis(
             except Exception as exc:
                 logger.warning("[IndexChange] No se pudo guardar optical_ndwi_change.png: %s", exc)
 
+    # ── Overlay "agua nueva": firma de agua en post que NO estaba en pre ──
+    # Marca solo la inundación, no el mar ni los cauces permanentes. La firma
+    # es por signo (NDWI>0, reforzada con MNDWI>0 si hay SWIR en ambas fechas)
+    # y la clase confirmada exige además una subida clara de NDWI.
+    overlays: list = []
+    if "NDWI" in pre_idx and "NDWI" in post_idx:
+        pre_water  = valid & (pre_idx["NDWI"] > 0.0)
+        post_water = valid & (post_idx["NDWI"] > 0.0)
+        if "MNDWI" in pre_idx and "MNDWI" in post_idx:
+            pre_water  = pre_water  & (pre_idx["MNDWI"] > 0.0)
+            post_water = post_water & (post_idx["MNDWI"] > 0.0)
+        appeared  = post_water & ~pre_water
+        confirmed = appeared & (changes["NDWI"] > 0.10)
+        probable  = appeared & ~confirmed
+        stats["pct_new_water"] = round(float(np.sum(appeared)) / total * 100, 2)
+        if bool(np.any(appeared)):
+            try:
+                _save_overlay_png(appeared.shape, [
+                    (probable,  [80, 180, 255, 130]),
+                    (confirmed, [0, 100, 200, 200]),
+                ], outputs_dir / "overlay_new_water.png")
+                output_files.append(str(outputs_dir / "overlay_new_water.png"))
+                overlays.append({
+                    "id": "new_water",
+                    "name": "Agua nueva (inundación)",
+                    "file": "overlay_new_water.png",
+                    "bounds": _raster_bounds_4326(post_files),
+                    "legend": [
+                        {"color": "#50b4ff", "label": "Agua nueva probable"},
+                        {"color": "#0064c8", "label": "Agua nueva confirmada"},
+                    ],
+                })
+                logger.info("[Overlay] overlay_new_water.png guardado — %.2f%% agua nueva",
+                            stats["pct_new_water"])
+            except Exception as exc:
+                logger.warning("[Overlay] No se pudo guardar overlay_new_water.png: %s", exc)
+
     logger.info("[IndexChange] índices=%s stats=%s", list(changes.keys()), stats)
-    return {"INDEX_CHANGE": stats}, output_files
+    return {"INDEX_CHANGE": stats}, output_files, overlays
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1054,19 +1314,23 @@ class AnalystAgent:
                     computed_indices.setdefault(png.stem.upper(), {})
 
         # ── Análisis SAR Sentinel-1 (solo cuando hay datos disponibles) ────
+        map_overlays: list = []
         sar_available = state.get("sar_available") or False
         if sar_available:
             pre_files  = state.get("pre_scene_files") or []
             post_files = [f for f in (state.get("downloaded_files") or [])
                           if "_post_VV.tif" in f]
-            sar_indices, sar_files = _sar_flood_analysis(
+            location = state.get("location") or {}
+            sar_indices, sar_files, sar_overlays = _sar_flood_analysis(
                 pre_files=pre_files,
                 post_files=post_files,
                 outputs_dir=OUTPUTS_DIR,
+                bbox=location.get("bbox") if isinstance(location, dict) else None,
             )
             if sar_indices:
                 computed_indices.update(sar_indices)
                 output_files.extend(sar_files)
+                map_overlays.extend(sar_overlays)
                 logger.info("[Analyst] SAR índices fusionados: %s", list(sar_indices.keys()))
             else:
                 logger.warning("[Analyst] SAR no devolvió resultados (fallback óptico)")
@@ -1075,10 +1339,13 @@ class AnalystAgent:
         # CUALQUIER tipo de análisis (no solo inundación): evita que una señal
         # localizada (una inundación, un incendio, una mancha urbana) se diluya
         # en la media de un bbox grande, y filtra nubes/sombras con SCL.
-        ie_indices, ie_files = _index_extent_analysis(downloaded, OUTPUTS_DIR)
+        ie_indices, ie_files, ie_overlays = _index_extent_analysis(
+            downloaded, OUTPUTS_DIR, analysis_type=state.get("analysis_type")
+        )
         if ie_indices:
             computed_indices.update(ie_indices)
             output_files.extend(ie_files)
+            map_overlays.extend(ie_overlays)
             logger.info("[Analyst] INDEX_EXTENT calculado: %s", ie_indices["INDEX_EXTENT"])
         else:
             logger.warning("[Analyst] INDEX_EXTENT no disponible (bandas insuficientes)")
@@ -1090,7 +1357,7 @@ class AnalystAgent:
             post_optical_files = [
                 f for f in downloaded if any(f.endswith(f"_{s}.tif") for s in _RECOGNIZED_SUFFIXES)
             ]
-            ic_indices, ic_files = _index_change_analysis(
+            ic_indices, ic_files, ic_overlays = _index_change_analysis(
                 pre_files=pre_optical_files,
                 post_files=post_optical_files,
                 outputs_dir=OUTPUTS_DIR,
@@ -1098,9 +1365,19 @@ class AnalystAgent:
             if ic_indices:
                 computed_indices.update(ic_indices)
                 output_files.extend(ic_files)
+                map_overlays.extend(ic_overlays)
                 logger.info("[Analyst] INDEX_CHANGE calculado: %s", ic_indices["INDEX_CHANGE"])
             else:
                 logger.warning("[Analyst] INDEX_CHANGE no disponible")
+
+        # Cuando hay detección de agua NUEVA (óptica pre/post o SAR), la capa
+        # estática con TODAS las zonas de agua (incluido el mar y los cauces
+        # permanentes) se deja oculta por defecto — sigue disponible desde la
+        # leyenda del visor, pero lo que se muestra es solo la inundación.
+        if any(o["id"] in ("new_water", "sar_flood") for o in map_overlays):
+            for o in map_overlays:
+                if o["id"] == "water":
+                    o["visible"] = False
 
         logger.info(
             "[Analyst] computed_indices=%s  output_files=%d  sar=%s  error=%s",
@@ -1115,6 +1392,7 @@ class AnalystAgent:
             "execution_result": execution_result,
             "computed_indices": computed_indices,
             "output_files": output_files,
+            "map_overlays": map_overlays or None,
             "code_iterations": iterations,
             "analysis_error": (
                 execution_result.get("error") if execution_result else "No se generó código"
